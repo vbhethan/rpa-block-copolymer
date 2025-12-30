@@ -128,50 +128,62 @@ class BlockCopolymer:
 
     def compute_gamma_q(self, N=None):
         """
-        Compute gamma_q everywhere on the q-space grid.
-
-        Parameters:
-        -----------
-        N : float, optional
-            Total chain length. If None, computed as sum of block_lengths.
-
-        Returns:
-        --------
-        gamma_q_grid : np.ndarray
-            Array of shape (*grid_shape, n_components, n_components) containing
-            gamma_q matrices at each grid point.
+        Vectorized computation of gamma_q over the full q-space grid.
+        Avoids Python loops by broadcasting over the grid and inverting all
+        structure-factor matrices in a single call. q=0 points are left as 0.
         """
         # Compute N if not provided
         if N is None:
             N = np.sum(self.block_lengths)
 
-        # Get q-space grid (magnitude of k-vectors)
         q_grid = self.phi_grid.k_magnitude
+        q2 = q_grid**2
         grid_shape = self.phi_grid.grid_shape
+        n = self.n_components
 
-        # Initialize output array: (*grid_shape, n_components, n_components)
-        gamma_q_grid = np.zeros((*grid_shape, self.n_components, self.n_components))
+        # Mask to skip the singular q=0 points
+        q_mask = q_grid >= 1e-10
 
-        # Iterate over all grid points
-        for idx in np.ndindex(grid_shape):
-            q = q_grid[idx]
-            # Skip q=0 values (keep gamma_q as 0 for these points)
-            if q < 1e-10:  # Use small epsilon to handle floating point precision
-                continue
-            # Compute gamma_q at this q value
-            gamma_matrix = gamma_q(
-                q,
-                self.chi_matrix,
-                self.l_ij_matrix,
-                self.block_fractions,
-                N,
-                self.kuhn_length,
+        # Broadcasted Rouse variables xi for each component on the grid
+        f = np.asarray(self.block_fractions)
+        xi = q2[..., None] * N * f * self.kuhn_length**2 / 6
+
+        # Diagonal terms h_ii (use where to avoid flattening/broadcast bugs)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            h_ii = np.where(
+                xi > 0,
+                (2 * N * f**2) / (xi**2) * (np.exp(-xi) - 1 + xi),
+                0.0,
             )
-            gamma_q_grid[idx] = gamma_matrix
 
-        # Store as instance variable
+        # Off-diagonal terms h_ij assembled with broadcasting
+        xi_i = xi[..., :, None]
+        xi_j = xi[..., None, :]
+        q2_broadcast = q2[..., None, None]
+        with np.errstate(divide="ignore", invalid="ignore"):
+            mask_ij = (xi_i > 0) & (xi_j > 0)
+            prefactor = np.where(
+                mask_ij,
+                (N * (f[:, None] * f[None, :])) / (xi_i * xi_j),
+                0.0,
+            )
+            h_matrix = prefactor
+            h_matrix *= (np.exp(-xi_i) - 1) * (np.exp(-xi_j) - 1)
+            h_matrix *= np.exp(-self.l_ij_matrix * q2_broadcast / 6)
+
+        # Insert diagonal h_ii values
+        for i in range(n):
+            h_matrix[..., i, i] = h_ii[..., i]
+
+        # Invert structure factor and add chi for q != 0
+        structure_factor = h_matrix
+        gamma_q_grid = np.zeros((*grid_shape, n, n))
+        if np.any(q_mask):
+            sf_nonzero = structure_factor[q_mask]
+            gamma_nonzero = np.linalg.inv(sf_nonzero) + self.chi_matrix
+            gamma_q_grid[q_mask] = gamma_nonzero
+
         self.gamma_q = gamma_q_grid
-
         return gamma_q_grid
 
     def free_energy_functional(self):
@@ -190,24 +202,18 @@ class BlockCopolymer:
         return np.real(free_energy)
 
     def compute_interaction_enthalpy(self):
-        # compute the interaction enthalpy \sum_ij \int dq Gamma_ij(q)delta_phi_i(q) delta_phi_j(-q)
-        # Since delta_phi(r) is real valued everywhere, use the conjugate for the (-q)
-        delta_phi_q_conjugate = np.conj(self.phi_grid.delta_phi_q)
+        # Interaction enthalpy: 0.5 * sum_{ij} ∑_q Γ_ij(q) δφ_i(q) δφ_j(-q)
+        # Use einsum to contract components and grid axes in one call.
+        delta_phi_q = self.phi_grid.delta_phi_q
+        # Move component axis to the end so ellipsis aligns across operands
+        delta_phi_q_grid_last = np.moveaxis(delta_phi_q, 0, -1)
+        delta_phi_q_conjugate = np.conj(delta_phi_q_grid_last)
         volume = np.prod(self.phi_grid.box_length)
         N_points = np.prod(self.phi_grid.grid_shape)
         normalization = volume / (N_points**2)
-        interaction_enthalpy = sum(
-            sum(
-                np.sum(
-                    self.gamma_q[..., i, j]
-                    * self.phi_grid.delta_phi_q[i]
-                    * delta_phi_q_conjugate[j]
-                )
-                for j in range(self.n_components)
-            )
-            for i in range(self.n_components)
-        )
-        # Take real part to handle numerical precision issues (should be real)
+        # First contract gamma_q with δφ_j(-q) over j, then with δφ_i(q) over i
+        tmp = np.einsum("...ij,...j->...i", self.gamma_q, delta_phi_q_conjugate)
+        interaction_enthalpy = np.sum(tmp * delta_phi_q_grid_last)
         return 0.5 * np.real(interaction_enthalpy) * normalization
 
     def ideal_mixing_entropy(self):
