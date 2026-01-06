@@ -245,8 +245,8 @@ def initialize_phi_values_satisfying_constraints(
 if __name__ == "__main__":
     # Example parameters (you can modify these)
     n_components = 3
-    block_lengths = np.array([10.0, 20.0, 30.0])
-    block_fractions = np.array([0.33, 0.33, 0.34])
+    block_lengths = np.array([10.0, 10.0, 10.0])
+    block_fractions = np.array([1 / 3, 1 / 3, 1 / 3])
     chi_matrix = np.array(
         [
             [0.0, 0.1, 0.2],
