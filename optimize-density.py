@@ -1,6 +1,8 @@
 from scipy.optimize import minimize
 import numpy as np
 from rpa import ABCBlockCopolymer, phi_grid
+import matplotlib.pyplot as plt
+import pickle
 
 
 def create_optimization_problem(copolymer):
@@ -243,8 +245,8 @@ def initialize_phi_values_satisfying_constraints(
 if __name__ == "__main__":
     # Example parameters (you can modify these)
     n_components = 3
-    block_lengths = np.array([10.0, 20.0, 30.0])
-    block_fractions = np.array([0.33, 0.33, 0.34])
+    block_lengths = np.array([10.0, 10.0, 10.0])
+    block_fractions = np.array([1 / 3, 1 / 3, 1 / 3])
     chi_matrix = np.array(
         [
             [0.0, 0.1, 0.2],
@@ -310,3 +312,22 @@ if __name__ == "__main__":
     for i in range(n_components):
         sum_delta_phi = np.sum(optimized_copolymer.phi_grid.delta_phi_i[i])
         print(f"  Component {i}: sum(delta_phi) = {sum_delta_phi:.6e}")
+
+    # Save the density profile to disk
+    npy_filename = "density_profile.npy"
+    np.save(npy_filename, optimized_copolymer.phi_grid.phi_values)
+    print(f"Density profile saved to {npy_filename}")
+
+    # Save the optimized copolymer to disk
+    copolymer_filename = "optimized_copolymer.pkl"
+    with open(copolymer_filename, "wb") as f:
+        pickle.dump(optimized_copolymer, f)
+    print(f"Optimized copolymer saved to {copolymer_filename}")
+
+    # Plot the density profile of the 3 components
+    fig, axs = plt.subplots(1, 3, figsize=(15, 5))
+    for i in range(n_components):
+        axs[i].imshow(optimized_copolymer.phi_grid.phi_values[i], cmap="viridis")
+        axs[i].set_title(f"Component {i}")
+    plt.savefig("density_profile.png")
+    plt.close()
