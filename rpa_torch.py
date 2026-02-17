@@ -77,6 +77,8 @@ class BlockCopolymerFreeEnergy(nn.Module):
         optimize_box: bool = False,
     ):
         super().__init__()
+        self.real_dtype = torch.float64
+        self.complex_dtype = torch.complex128
 
         # Validate inputs
         if block_fractions is None:
@@ -86,9 +88,9 @@ class BlockCopolymerFreeEnergy(nn.Module):
         if l_ij_matrix is None:
             raise ValueError("l_ij_matrix must be provided")
 
-        block_fractions = torch.as_tensor(block_fractions, dtype=torch.float32)
-        chi_matrix = torch.as_tensor(chi_matrix, dtype=torch.float32)
-        l_ij_matrix = torch.as_tensor(l_ij_matrix, dtype=torch.float32)
+        block_fractions = torch.as_tensor(block_fractions, dtype=self.real_dtype)
+        chi_matrix = torch.as_tensor(chi_matrix, dtype=self.real_dtype)
+        l_ij_matrix = torch.as_tensor(l_ij_matrix, dtype=self.real_dtype)
 
         # Validate block fractions sum to 1
         if not torch.allclose(block_fractions.sum(), block_fractions.new_tensor(1.0)):
@@ -140,20 +142,26 @@ class BlockCopolymerFreeEnergy(nn.Module):
 
         if optimize_box:
             # Learnable box length parameters (use log for numerical stability)
-            self.log_Lx = nn.Parameter(torch.tensor(math.log(self._Lx_init)))
-            self.log_Ly = nn.Parameter(torch.tensor(math.log(self._Ly_init)))
+            self.log_Lx = nn.Parameter(
+                torch.tensor(math.log(self._Lx_init), dtype=self.real_dtype)
+            )
+            self.log_Ly = nn.Parameter(
+                torch.tensor(math.log(self._Ly_init), dtype=self.real_dtype)
+            )
         else:
             # Fixed box length (not learnable)
             self.register_buffer(
-                "_log_Lx_fixed", torch.tensor(math.log(self._Lx_init))
+                "_log_Lx_fixed",
+                torch.tensor(math.log(self._Lx_init), dtype=self.real_dtype),
             )
             self.register_buffer(
-                "_log_Ly_fixed", torch.tensor(math.log(self._Ly_init))
+                "_log_Ly_fixed",
+                torch.tensor(math.log(self._Ly_init), dtype=self.real_dtype),
             )
 
         # Pre-compute k-space grid structure (normalized frequencies, independent of L)
-        kx_norm = torch.fft.fftfreq(Nx)
-        ky_norm = torch.fft.fftfreq(Ny)
+        kx_norm = torch.fft.fftfreq(Nx, dtype=self.real_dtype)
+        ky_norm = torch.fft.fftfreq(Ny, dtype=self.real_dtype)
         KX_norm, KY_norm = torch.meshgrid(kx_norm, ky_norm, indexing="ij")
         self.register_buffer("KX_norm", KX_norm)
         self.register_buffer("KY_norm", KY_norm)
@@ -170,7 +178,10 @@ class BlockCopolymerFreeEnergy(nn.Module):
         # Initialize learnable order parameter field delta_phi_i(r)
         # for all components. Constraints are enforced through projection
         # in _project_order_parameter.
-        delta_phi_init = torch.randn(self.n_components, Nx, Ny) * init_amplitude
+        delta_phi_init = (
+            torch.randn(self.n_components, Nx, Ny, dtype=self.real_dtype)
+            * init_amplitude
+        )
         delta_phi_init = delta_phi_init - delta_phi_init.mean(
             dim=(-2, -1), keepdim=True
         )
@@ -319,7 +330,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Gamma_ij = Gamma_ideal_ij + self.chi_matrix.unsqueeze(0).unsqueeze(0)
 
         # Convert to complex for Fourier space operations
-        Gamma_ij = Gamma_ij.to(torch.complex64)
+        Gamma_ij = Gamma_ij.to(self.complex_dtype)
 
         # Zero out k=0 mode (will be excluded from sum anyway)
         Gamma_ij[0, 0, :, :] = 0
@@ -356,7 +367,9 @@ class BlockCopolymerFreeEnergy(nn.Module):
         delta_phi = delta_phi - delta_phi.mean(dim=0, keepdim=True)
         return delta_phi
 
-    def _get_order_parameter(self, delta_phi: torch.Tensor | None = None) -> torch.Tensor:
+    def _get_order_parameter(
+        self, delta_phi: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Return projected order parameter field used in free-energy calculation.
 
@@ -366,7 +379,11 @@ class BlockCopolymerFreeEnergy(nn.Module):
             delta_phi = self.delta_phi
         return self._project_order_parameter(delta_phi)
 
-    def forward(self, delta_phi: torch.Tensor | None = None) -> torch.Tensor:
+    def forward(
+        self,
+        delta_phi: torch.Tensor | None = None,
+        Gamma_ij: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         """
         Compute the total free energy of the system.
 
@@ -375,6 +392,9 @@ class BlockCopolymerFreeEnergy(nn.Module):
         delta_phi : torch.Tensor, optional
             Order parameter field with shape (n_components, Nx, Ny).
             If None, uses the module's internal learnable `self.delta_phi`.
+        Gamma_ij : torch.Tensor, optional
+            Pre-computed vertex function. If provided, skips recomputation.
+            Useful when the box dimensions are held fixed across many calls.
 
         Returns
         -------
@@ -385,11 +405,12 @@ class BlockCopolymerFreeEnergy(nn.Module):
         delta_phi = self._get_order_parameter(delta_phi)
 
         # Get current Gamma_ij
-        if self.optimize_box:
-            K2 = self._compute_K2(self.Lx, self.Ly)
-            Gamma_ij = self._compute_gamma_ij(K2)
-        else:
-            Gamma_ij = self._Gamma_ij_cached
+        if Gamma_ij is None:
+            if self.optimize_box:
+                K2 = self._compute_K2(self.Lx, self.Ly)
+                Gamma_ij = self._compute_gamma_ij(K2)
+            else:
+                Gamma_ij = self._Gamma_ij_cached
 
         # Compute interaction energy in Fourier space
         Delta_F_int = self._compute_interaction_energy(delta_phi, Gamma_ij)
@@ -468,7 +489,8 @@ class BlockCopolymerFreeEnergy(nn.Module):
         rho = delta_phi + f_expanded * self.phi_bar
 
         # Clamp to avoid log of negative numbers during optimization
-        rho = torch.clamp(rho, min=1e-10)
+        # TODO: check if this is messing with gradients, going to try turning off for now
+        # rho = torch.clamp(rho, min=1e-10)
 
         # Compute mixing entropy integral with 1/N prefactor
         # Sum over components and spatial points
@@ -477,7 +499,9 @@ class BlockCopolymerFreeEnergy(nn.Module):
 
         return F_mixing
 
-    def _compute_mixing_entropy_quadratic(self, delta_phi: torch.Tensor) -> torch.Tensor:
+    def _compute_mixing_entropy_quadratic(
+        self, delta_phi: torch.Tensor
+    ) -> torch.Tensor:
         """
         Compute the 2nd order expansion of mixing entropy F_mix^(2).
 
@@ -530,7 +554,9 @@ class BlockCopolymerFreeEnergy(nn.Module):
             )
         return rho
 
-    def get_order_parameters(self, delta_phi: torch.Tensor | None = None) -> torch.Tensor:
+    def get_order_parameters(
+        self, delta_phi: torch.Tensor | None = None
+    ) -> torch.Tensor:
         """
         Get the current order parameters (constraints enforced).
 
