@@ -1,339 +1,676 @@
-import numpy as np
+"""
+Block Copolymer Free Energy Module with Arbitrary Architectures
+
+A PyTorch module for computing and optimizing the free energy functional
+of block copolymer systems using the Random Phase Approximation (RPA).
+Supports arbitrary chain architectures through distance matrices.
+Supports 1D, 2D, and 3D spatial grids.
+"""
+
+# Fix OpenMP conflict on macOS (must be before importing torch/numpy)
+import math
+import os
+
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
+import torch
+import torch.nn as nn
 
 
-class phi_grid:
+class BlockCopolymerFreeEnergy(nn.Module):
+    """
+    Base class for block copolymer free energy with arbitrary architectures.
+
+    The free energy functional consists of:
+    - Interaction energy (computed in Fourier space using RPA)
+    - Mixing entropy (real space)
+    - 2nd order mixing entropy expansion (real space)
+
+    This module supports arbitrary chain architectures through the distance
+    matrix l_ij, which encodes the contour distance between blocks i and j.
+
+    Physical constraints:
+    1. Local incompressibility: sum_i rho_i(r) = phi_bar at every point
+       This implies one component is determined by others.
+    2. Global zero-mean: integral of phi_i over space must be zero for all i
+
+    Parameters
+    ----------
+    N : int
+        Total number of monomers in the polymer chain
+    b : float
+        Kuhn length (statistical segment length)
+    block_fractions : list or array
+        Volume fractions of each block [f_A, f_B, ...], must sum to 1
+    chi_matrix : array-like
+        Flory-Huggins interaction parameter matrix (n x n)
+        chi_ij represents the interaction between species i and j
+    phi_bar : float
+        Mean density of the polymer melt
+    grid_shape : tuple of int
+        Number of grid points along each spatial dimension.
+        E.g. (128,) for 1D, (64, 64) for 2D, (32, 32, 32) for 3D.
+    box_lengths : tuple of float, optional
+        Box lengths along each spatial dimension (same length as grid_shape).
+        Defaults to grid_shape[i] * b/2 for each dimension.
+    init_amplitude : float, optional
+        Amplitude of random initial fluctuations (default: 0.01)
+    optimize_box : bool, optional
+        If True, make the box lengths learnable parameters (default: False)
+    """
+
     def __init__(
         self,
-        grid_shape,
-        block_fractions,
-        phi_values=None,
-        n_components=None,
-        box_length=1.0,
+        N: int = 100,
+        b: float = 1.0,
+        block_fractions: list = None,
+        chi_matrix: torch.Tensor = None,
+        l_ij_matrix: torch.Tensor = None,
+        phi_bar: float = 1.0,
+        grid_shape: tuple[int, ...] = (64, 64),
+        box_lengths: tuple[float, ...] | None = None,
+        init_amplitude: float = 0.01,
+        optimize_box: bool = False,
     ):
-        self.grid_shape = grid_shape
-        ndim = len(grid_shape)
+        super().__init__()
+        self.real_dtype = torch.float64
+        self.complex_dtype = torch.complex128
 
-        # Handle box_length: convert scalar to tuple or validate tuple
-        if np.isscalar(box_length):
-            self.box_length = tuple([box_length] * ndim)
-        else:
-            assert len(box_length) == ndim, (
-                f"box_length must have length {ndim} to match grid_shape"
+        # Validate inputs
+        if block_fractions is None:
+            raise ValueError("block_fractions must be provided")
+        if chi_matrix is None:
+            raise ValueError("chi_matrix must be provided")
+        if l_ij_matrix is None:
+            raise ValueError("l_ij_matrix must be provided")
+
+        block_fractions = torch.as_tensor(block_fractions, dtype=self.real_dtype)
+        chi_matrix = torch.as_tensor(chi_matrix, dtype=self.real_dtype)
+        l_ij_matrix = torch.as_tensor(l_ij_matrix, dtype=self.real_dtype)
+
+        # Validate block fractions sum to 1
+        if not torch.allclose(block_fractions.sum(), block_fractions.new_tensor(1.0)):
+            raise ValueError(
+                f"block_fractions must sum to 1, got {block_fractions.sum()}"
             )
-            self.box_length = tuple(box_length)
+        if torch.any(block_fractions < 0):
+            raise ValueError("block_fractions must be strictly positive")
 
-        if phi_values is not None:
-            n_components = phi_values.shape[0]
-            assert phi_values.shape[1:] == grid_shape
-            self.phi_values = phi_values
-        else:
-            self.phi_values = np.random.rand(*(n_components, *grid_shape))
+        n_components = int(len(block_fractions))
+        expected_shape = (n_components, n_components)
+        if chi_matrix.shape != expected_shape:
+            raise ValueError(
+                f"chi_matrix must have shape {expected_shape}, got {chi_matrix.shape}"
+            )
+        if l_ij_matrix.shape != expected_shape:
+            raise ValueError(
+                f"l_ij_matrix must have shape {expected_shape}, got {l_ij_matrix.shape}"
+            )
+        if not torch.allclose(chi_matrix, chi_matrix.T):
+            raise ValueError("chi_matrix must be symmetric")
+        if not torch.allclose(l_ij_matrix, l_ij_matrix.T):
+            raise ValueError("l_ij_matrix must be symmetric")
+
+        # Store physical parameters
+        self.N = N
+        self.b = b
         self.n_components = n_components
+        self.phi_bar = phi_bar
 
-        # Compute the delta_phi_i on grid
-        # Reshape block_fractions for proper broadcasting: (n_components,) -> (n_components, 1, 1, ...)
-        block_fractions_reshaped = block_fractions.reshape(n_components, *([1] * ndim))
-        self.delta_phi_i = self.phi_values - block_fractions_reshaped
+        # Store block fractions as buffer
+        f_vec = block_fractions.clone().detach()
+        self.register_buffer("f_vec", f_vec)
 
-        # Only transform over spatial dimensions (axes 1, 2, ..., ndim), not component axis (0)
-        spatial_axes = tuple(range(1, ndim + 1))
-        self.delta_phi_q = np.fft.fftn(self.delta_phi_i, axes=spatial_axes)
+        # Store chi matrix as buffer (already scaled by N in input)
+        chi_tensor = chi_matrix.clone().detach()
+        self.register_buffer("chi_matrix", chi_tensor)
 
-        # Generate the real space and k-space mesh grids
-        self._compute_grids()
+        # Grid parameters (dimension-agnostic)
+        self.grid_shape = tuple(grid_shape)
+        self.ndim = len(grid_shape)
+        self.n_grid_points = math.prod(grid_shape)
+        # Spatial dims of delta_phi tensor: axes 1..ndim (axis 0 is component)
+        self.spatial_dims = tuple(range(1, self.ndim + 1))
 
-    def _compute_grids(self):
-        """
-        Compute and store real space and k-space grid coordinates.
-
-        Stores:
-        - self.r_grids: tuple of real space coordinate grids in physical units (r_x, r_y, ...)
-                       where r_i = n_i * L_i / M_i, with n_i integer indices and M_i grid points
-        - self.k_grids: tuple of k-space coordinate grids (k_x, k_y, ...)
-        - self.k_magnitude: magnitude of k-vector at each grid point |k|
-
-        For k-space: k = 2π * q / L where q are integer mode numbers and L is box_length
-        """
-        ndim = len(self.grid_shape)
-
-        # Compute real space coordinate grids in physical units
-        # r_i = n_i * L_i / M_i where n_i are integer indices (0, 1, ..., M_i-1)
-        r_arrays = []
-        for n, L in zip(self.grid_shape, self.box_length):
-            # Integer indices: 0, 1, 2, ..., n-1
-            n_1d = np.arange(n)
-            # Convert to physical units: r = n * L / M
-            r_1d = n_1d * L / n
-            r_arrays.append(r_1d)
-
-        if ndim == 1:
-            self.r_grids = (r_arrays[0],)
-        else:
-            r_mesh = np.meshgrid(*r_arrays, indexing="ij")
-            self.r_grids = tuple(r_mesh)
-
-        # Compute k-space grids
-        # For each dimension: grid_spacing = box_length / n
-        # fftfreq(n, d) gives frequencies f = m/(n*d) where m are mode numbers
-        # k = 2π * f = 2π * m / (n*d) = 2π * m / box_length
-        k_arrays = []
-        for n, L in zip(self.grid_shape, self.box_length):
-            # Grid spacing for this dimension
-            grid_spacing = L / n
-            # Get frequency array for this dimension
-            freq = np.fft.fftfreq(n, d=grid_spacing)
-            # Convert to k-space: k = 2π * frequency
-            k_1d = 2 * np.pi * freq
-            k_arrays.append(k_1d)
-
-        # Create meshgrids for multi-dimensional case
-        if ndim == 1:
-            self.k_grids = (k_arrays[0],)
-            self.k_magnitude = np.abs(k_arrays[0])
-        else:
-            # Create coordinate grids
-            k_mesh = np.meshgrid(*k_arrays, indexing="ij")
-            self.k_grids = tuple(k_mesh)
-
-            # Compute magnitude: |k| = sqrt(k_x^2 + k_y^2 + ...)
-            self.k_magnitude = np.sqrt(sum(k**2 for k in self.k_grids))
-
-
-class BlockCopolymer:
-    """
-    Base class for block copolymers.
-    It is used to store the necessary information to pass to the free energy functional later
-    The grid object for the density field is also contained in this class.
-    """
-
-    def __init__(
-        self,
-        n_components,
-        block_lengths,
-        block_fractions,
-        chi_matrix,
-        phi_grid,
-        kuhn_length=1.0,
-    ):
-        self.block_fractions = block_fractions
-        self.chi_matrix = chi_matrix
-        self.kuhn_length = kuhn_length
-        self.n_components = n_components
-        self.block_lengths = block_lengths
-        self.l_ij_matrix = self._compute_l_ij_matrix()
-
-        self.phi_grid = phi_grid
-
-        self.gamma_q = self.compute_gamma_q()
-
-    def compute_gamma_q(self, N=None):
-        """
-        Vectorized computation of gamma_q over the full q-space grid.
-        Avoids Python loops by broadcasting over the grid and inverting all
-        structure-factor matrices in a single call. q=0 points are left as 0.
-        """
-        # Compute N if not provided
-        if N is None:
-            N = np.sum(self.block_lengths)
-
-        q_grid = self.phi_grid.k_magnitude
-        q2 = q_grid**2
-        grid_shape = self.phi_grid.grid_shape
-        n = self.n_components
-
-        # Mask to skip the singular q=0 points
-        q_mask = q_grid >= 1e-10
-
-        # Broadcasted Rouse variables xi for each component on the grid
-        f = np.asarray(self.block_fractions)
-        xi = q2[..., None] * N * f * self.kuhn_length**2 / 6
-
-        # Diagonal terms h_ii (use where to avoid flattening/broadcast bugs)
-        with np.errstate(divide="ignore", invalid="ignore"):
-            h_ii = np.where(
-                xi > 0,
-                (2 * N * f**2) / (xi**2) * (np.exp(-xi) - 1 + xi),
-                0.0,
-            )
-
-        # Off-diagonal terms h_ij assembled with broadcasting
-        xi_i = xi[..., :, None]
-        xi_j = xi[..., None, :]
-        q2_broadcast = q2[..., None, None]
-        with np.errstate(divide="ignore", invalid="ignore"):
-            mask_ij = (xi_i > 0) & (xi_j > 0)
-            prefactor = np.where(
-                mask_ij,
-                (N * (f[:, None] * f[None, :])) / (xi_i * xi_j),
-                0.0,
-            )
-            h_matrix = prefactor
-            h_matrix *= (np.exp(-xi_i) - 1) * (np.exp(-xi_j) - 1)
-            h_matrix *= np.exp(-self.l_ij_matrix * q2_broadcast / 6)
-
-        # Insert diagonal h_ii values
-        for i in range(n):
-            h_matrix[..., i, i] = h_ii[..., i]
-
-        # Invert structure factor and add chi for q != 0
-        structure_factor = h_matrix
-        gamma_q_grid = np.zeros((*grid_shape, n, n))
-        if np.any(q_mask):
-            sf_nonzero = structure_factor[q_mask]
-            gamma_nonzero = np.linalg.inv(sf_nonzero) + self.chi_matrix
-            gamma_q_grid[q_mask] = gamma_nonzero
-
-        self.gamma_q = gamma_q_grid
-        return gamma_q_grid
-
-    def free_energy_functional(self):
-        # compute ideal mixing entropy
-        ideal_mixing_entropy = self.ideal_mixing_entropy()
-        # compute the interaction enthalpy
-        interaction_enthalpy = self.compute_interaction_enthalpy()
-        # compute the ideal mixing entropy second order
-        ideal_mixing_entropy_second_order = self.ideal_mixing_entropy_second_order()
-        free_energy = (
-            ideal_mixing_entropy
-            + interaction_enthalpy
-            - ideal_mixing_entropy_second_order
-        )
-        # Ensure return value is real (handle numerical precision issues)
-        return np.real(free_energy)
-
-    def compute_interaction_enthalpy(self):
-        # Interaction enthalpy: 0.5 * sum_{ij} ∑_q Γ_ij(q) δφ_i(q) δφ_j(-q)
-        # Use einsum to contract components and grid axes in one call.
-        delta_phi_q = self.phi_grid.delta_phi_q
-        # Move component axis to the end so ellipsis aligns across operands
-        delta_phi_q_grid_last = np.moveaxis(delta_phi_q, 0, -1)
-        delta_phi_q_conjugate = np.conj(delta_phi_q_grid_last)
-        volume = np.prod(self.phi_grid.box_length)
-        N_points = np.prod(self.phi_grid.grid_shape)
-        normalization = volume / (N_points**2)
-        # First contract gamma_q with δφ_j(-q) over j, then with δφ_i(q) over i
-        tmp = np.einsum("...ij,...j->...i", self.gamma_q, delta_phi_q_conjugate)
-        interaction_enthalpy = np.sum(tmp * delta_phi_q_grid_last)
-        return 0.5 * np.real(interaction_enthalpy) * normalization
-
-    def ideal_mixing_entropy(self):
-        return sum(
-            ideal_mixing_entropy(self.phi_grid.phi_values[i], self.block_fractions[i])
-            for i in range(self.n_components)
+        # Store grid shape as a buffer for convenience in computations
+        self.register_buffer(
+            "_grid_shape_tensor",
+            torch.tensor(grid_shape, dtype=self.real_dtype),
         )
 
-    def ideal_mixing_entropy_second_order(self):
-        return sum(
-            ideal_mixing_entropy_second_order(
-                self.phi_grid.phi_values[i],
-                self.phi_grid.delta_phi_i[i],
-                self.block_fractions[i],
-            )
-            for i in range(self.n_components)
-        )
-
-    def _compute_l_ij_matrix(self):
-        # Abstract method (TODO: look into implementing abstractmethod?)
-        pass
-
-
-class ABCBlockCopolymer(BlockCopolymer):
-    def __init__(
-        self,
-        n_components,
-        block_lengths,
-        block_fractions,
-        chi_matrix,
-        phi_grid,
-        kuhn_length=1.0,
-    ):
-        super().__init__(
-            n_components,
-            block_lengths,
-            block_fractions,
-            chi_matrix,
-            phi_grid,
-            kuhn_length,
-        )
-        # Recompute l_ij_matrix with ABC-specific values (overrides parent's computation)
-        self.l_ij_matrix = self._compute_l_ij_matrix()
-        # Recompute gamma_q with the correct l_ij_matrix
-        self.gamma_q = self.compute_gamma_q()
-
-    def _compute_l_ij_matrix(self):
-        l_ij_matrix = np.zeros((self.n_components, self.n_components))
-        l_ij_matrix[0, 1] = 0
-        l_ij_matrix[0, 2] = self.block_lengths[1] * self.kuhn_length**2
-        # The matrix is symmetric
-        l_ij_matrix = l_ij_matrix + l_ij_matrix.T
-        return l_ij_matrix
-
-
-def ideal_mixing_entropy(phi_i, f_i):
-    num_points = np.prod(phi_i.shape)
-    # Avoid log(0) by only computing where phi_i > 0
-    mask = phi_i > 0
-    integrand = np.zeros_like(phi_i)
-    integrand[mask] = phi_i[mask] / f_i * np.log(phi_i[mask])
-    return np.sum(integrand) / num_points
-
-
-def h_ii(xi_i, f_i, N):
-    return (2 * N * f_i**2) / (xi_i**2) * (np.exp(-1 * xi_i) - 1 + xi_i)
-
-
-def h_ij(q, xi_i, xi_j, l_ij, f_i, f_j, N):
-    """
-    l_ij: distance connecting the two blocks i and j: l_ij = M_ij * b^2
-    """
-    prefactor = (N * f_i * f_j) / (xi_i * xi_j)
-    return (
-        prefactor
-        * (np.exp(-1 * xi_i) - 1)
-        * (np.exp(-1 * xi_j) - 1)
-        * np.exp(-l_ij * q**2 / 6)
-    )
-
-
-def gamma_q(q, chi_matrix, l_ij_matrix, block_fractions, N, kuhn_length):
-    num_components = chi_matrix.shape[0]
-    structure_factor_matrix_ideal = np.zeros((num_components, num_components))
-    # Compute the diagonal elements
-    for i in range(num_components):
-        # Compute Rouse variable: xi_i = q^2 * N * f_i / 6
-        xi_i = q**2 * N * block_fractions[i] * kuhn_length**2 / 6
-        structure_factor_matrix_ideal[i, i] = h_ii(xi_i, block_fractions[i], N)
-    # Compute the off-diagonal elements
-    for i in range(num_components):
-        for j in range(num_components):
-            if i != j:
-                # Compute Rouse variables for both blocks
-                xi_i = q**2 * N * block_fractions[i] * kuhn_length**2 / 6
-                xi_j = q**2 * N * block_fractions[j] * kuhn_length**2 / 6
-                structure_factor_matrix_ideal[i, j] = h_ij(
-                    q,
-                    xi_i,
-                    xi_j,
-                    l_ij_matrix[i, j],
-                    block_fractions[i],
-                    block_fractions[j],
-                    N,
+        # Compute initial box lengths
+        if box_lengths is not None:
+            if len(box_lengths) != self.ndim:
+                raise ValueError(
+                    f"box_lengths must have {self.ndim} entries to match "
+                    f"grid_shape {grid_shape}, got {len(box_lengths)}"
                 )
-    # Add the chi matrix
-    gamma_matrix = np.linalg.inv(structure_factor_matrix_ideal) + chi_matrix
+            self._L_init = tuple(float(v) for v in box_lengths)
+        else:
+            self._L_init = tuple(float(n * b / 2) for n in grid_shape)
 
-    return gamma_matrix
+        # Box optimization flag
+        self.optimize_box = optimize_box
 
+        if optimize_box:
+            self.log_L = nn.Parameter(
+                torch.tensor([math.log(v) for v in self._L_init], dtype=self.real_dtype)
+            )
+        else:
+            self.register_buffer(
+                "_log_L_fixed",
+                torch.tensor(
+                    [math.log(v) for v in self._L_init], dtype=self.real_dtype
+                ),
+            )
 
-def ideal_mixing_entropy_second_order(phi_i, delta_phi_i, f_i):
-    """
-    Compute the second-order term in the expansion of ideal mixing entropy.
-    The second-order expansion of phi * log(phi) around f is: delta_phi^2 / (2 * f * phi)
-    """
-    num_points = np.prod(delta_phi_i.shape)
-    # Second-order term: delta_phi^2 / (2 * f_i * phi_i)
-    # Avoid division by zero where phi_i = 0
-    mask = phi_i > 0
-    integrand = np.zeros_like(delta_phi_i)
-    integrand[mask] = (delta_phi_i[mask]) ** 2 / (2 * phi_i[mask])
-    return np.sum(integrand) / num_points
+        # Pre-compute 1D normalized frequency vectors for each spatial axis
+        for d, n in enumerate(grid_shape):
+            freq = torch.fft.fftfreq(n, dtype=self.real_dtype)
+            self.register_buffer(f"_kfreq_{d}", freq)
+
+        # Register architecture distance matrix
+        self.register_buffer("l_ij_matrix", l_ij_matrix.clone().detach())
+
+        # Pre-compute and cache Gamma_ij if box is not optimized
+        if not optimize_box:
+            L_init_tensor = torch.tensor(self._L_init, dtype=self.real_dtype)
+            K2 = self._compute_K2(L_init_tensor)
+            Gamma_ij = self._compute_gamma_ij(K2)
+            self.register_buffer("_Gamma_ij_cached", Gamma_ij)
+
+        # Initialize learnable order parameter field delta_phi_i(r)
+        # for all components. Constraints are enforced through projection
+        # in _project_order_parameter.
+        delta_phi_init = (
+            torch.randn(self.n_components, *grid_shape, dtype=self.real_dtype)
+            * init_amplitude
+        )
+        delta_phi_init = delta_phi_init - delta_phi_init.mean(
+            dim=self.spatial_dims, keepdim=True
+        )
+        delta_phi_init = delta_phi_init - delta_phi_init.mean(dim=0, keepdim=True)
+        self.delta_phi = nn.Parameter(delta_phi_init)
+
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
+    @property
+    def L(self) -> torch.Tensor:
+        """Get current box lengths, shape (ndim,)."""
+        if self.optimize_box:
+            return torch.exp(self.log_L)
+        else:
+            return torch.exp(self._log_L_fixed)
+
+    @property
+    def spacing(self) -> torch.Tensor:
+        """Get current grid spacings, shape (ndim,)."""
+        return self.L / self._grid_shape_tensor
+
+    @property
+    def cell_vol(self) -> torch.Tensor:
+        """Get volume of a single grid cell (product of spacings)."""
+        return self.spacing.prod()
+
+    @property
+    def vol(self) -> torch.Tensor:
+        """Get current box volume (product of all box lengths)."""
+        return self.L.prod()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _f_expanded(self) -> torch.Tensor:
+        """Return f_vec reshaped for broadcasting over spatial dims: (n, 1, ..., 1)."""
+        return self.f_vec.view(-1, *([1] * self.ndim))
+
+    def _compute_K2(self, L: torch.Tensor) -> torch.Tensor:
+        """
+        Compute k-space grid K2 = sum_d k_d^2 for given box dimensions.
+
+        Parameters
+        ----------
+        L : torch.Tensor
+            Box lengths, shape (ndim,)
+
+        Returns
+        -------
+        K2 : torch.Tensor
+            k-squared grid of shape (*grid_shape)
+        """
+        K2 = torch.zeros(self.grid_shape, dtype=self.real_dtype, device=L.device)
+        for d in range(self.ndim):
+            freq = getattr(self, f"_kfreq_{d}")
+            k_d = 2 * math.pi * freq * self.grid_shape[d] / L[d]
+            shape = [1] * self.ndim
+            shape[d] = self.grid_shape[d]
+            K2 = K2 + k_d.view(shape) ** 2
+        return K2
+
+    def _compute_gamma_ij(self, K2: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the vertex function Gamma_ij(q) for all q vectors.
+
+        Gamma_ij = (S^ideal_ij)^-1 + chi_ij
+
+        where S^ideal is the ideal structure factor matrix computed from
+        Debye functions with architecture-dependent distance factors.
+
+        Parameters
+        ----------
+        K2 : torch.Tensor
+            k-squared grid of shape (*grid_shape)
+
+        Returns
+        -------
+        Gamma_ij : torch.Tensor
+            Vertex function of shape (*grid_shape, n_components, n_components)
+        """
+        N, b = self.N, self.b
+        n = self.n_components
+        f = self.f_vec  # (n,)
+        phi_bar = self.phi_bar
+        ndim = self.ndim
+
+        # Compute xi parameters for each component: xi_i = N * f_i * b^2 * K2 / 6
+        # Shape: (*grid_shape, n)
+        xi = K2.unsqueeze(-1) * N * f * b**2 / 6
+
+        # Numerically stable small-x forms:
+        # u(x) = (1 - exp(-x)) / x, u(0) = 1
+        # v(x) = 2 * (exp(-x) - 1 + x) / x^2, v(0) = 1
+        eps = 1e-8
+        xi_safe = torch.where(xi > eps, xi, torch.ones_like(xi))
+        u = torch.where(
+            xi > eps,
+            (1 - torch.exp(-xi)) / xi_safe,
+            1 - xi / 2 + xi**2 / 6,
+        )
+        v = torch.where(
+            xi > eps,
+            2 * (torch.exp(-xi) - 1 + xi) / (xi_safe**2),
+            1 - xi / 3 + xi**2 / 12,
+        )
+
+        # Diagonal Debye terms
+        h_diag = N * f**2 * v
+
+        # Compute off-diagonal terms h_ij(q) with distance factors
+        # Shape: (*grid_shape, n, n)
+        u_i = u.unsqueeze(-1)  # (*grid_shape, n, 1)
+        u_j = u.unsqueeze(-2)  # (*grid_shape, 1, n)
+
+        f_i = f.view(*([1] * ndim), -1, 1)  # (1,...,1, n, 1)
+        f_j = f.view(*([1] * ndim), 1, -1)  # (1,...,1, 1, n)
+
+        # Distance factor: exp(-l_ij * N * b^2 * K2 / 6)
+        K2_expanded = K2.unsqueeze(-1).unsqueeze(-1)  # (*grid_shape, 1, 1)
+        distance_factor = torch.exp(-self.l_ij_matrix * K2_expanded / 6)
+
+        # Off-diagonal Debye terms with stable low-q limit
+        h_matrix = N * f_i * f_j * u_i * u_j * distance_factor
+
+        # Insert diagonal values
+        eye = torch.eye(n, device=K2.device, dtype=torch.bool)
+        eye = eye.view(*([1] * ndim), n, n).expand(*self.grid_shape, -1, -1)
+
+        h_diag_expanded = torch.diag_embed(h_diag)  # (*grid_shape, n, n)
+
+        h_full = torch.where(eye, h_diag_expanded, h_matrix)
+
+        # Keep the structure factor Hermitian/symmetric before inversion.
+        h_full = 0.5 * (h_full + h_full.transpose(-1, -2))
+
+        # Construct ideal structure factor matrix: S^ideal_ij = (phi_bar / N) * h_ij
+        S_ideal = (phi_bar / N) * h_full
+
+        # Handle k=0 mode specially to avoid singular matrix
+        k0_idx = (0,) * ndim
+        S_ideal[k0_idx] = torch.eye(n, device=K2.device)
+
+        # Compute inverse: Gamma^ideal_ij = (S^ideal)^-1
+        Gamma_ideal_ij = torch.linalg.inv(S_ideal)
+
+        # Add chi interaction: Gamma_ij = Gamma^ideal_ij - 2*chi_ij
+        chi_expanded = self.chi_matrix.view(*([1] * ndim), n, n)
+        Gamma_ij = Gamma_ideal_ij + chi_expanded
+
+        # Convert to complex for Fourier space operations
+        Gamma_ij = Gamma_ij.to(self.complex_dtype)
+
+        # Zero out k=0 mode (will be excluded from sum anyway)
+        Gamma_ij[(*k0_idx, slice(None), slice(None))] = 0
+
+        return Gamma_ij
+
+    def _project_order_parameter(self, delta_phi: torch.Tensor) -> torch.Tensor:
+        """
+        Project order parameter onto physical constraint manifold.
+
+        Enforces:
+        1) global zero-mean for each component
+        2) local incompressibility sum_i delta_phi_i(r) = 0
+
+        Parameters
+        ----------
+        delta_phi : torch.Tensor
+            Input order parameter, shape (n_components, *grid_shape)
+
+        Returns
+        -------
+        torch.Tensor
+            Projected order parameter with same shape as input
+        """
+        expected_shape = (self.n_components, *self.grid_shape)
+        if tuple(delta_phi.shape) != expected_shape:
+            raise ValueError(
+                f"delta_phi must have shape {expected_shape}, got {tuple(delta_phi.shape)}"
+            )
+
+        # Global zero-mean for each component (average over spatial dims)
+        delta_phi = delta_phi - delta_phi.mean(dim=self.spatial_dims, keepdim=True)
+        # Local incompressibility (sum over components equals zero pointwise)
+        delta_phi = delta_phi - delta_phi.mean(dim=0, keepdim=True)
+        return delta_phi
+
+    def _get_order_parameter(
+        self, delta_phi: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Return projected order parameter field used in free-energy calculation.
+
+        If delta_phi is not provided, uses the internal learnable field.
+        """
+        if delta_phi is None:
+            delta_phi = self.delta_phi
+        return self._project_order_parameter(delta_phi)
+
+    def forward(
+        self,
+        delta_phi: torch.Tensor | None = None,
+        Gamma_ij: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """
+        Compute the total free energy of the system.
+
+        Parameters
+        ----------
+        delta_phi : torch.Tensor, optional
+            Order parameter field with shape (n_components, *grid_shape).
+            If None, uses the module's internal learnable `self.delta_phi`.
+        Gamma_ij : torch.Tensor, optional
+            Pre-computed vertex function. If provided, skips recomputation.
+            Useful when the box dimensions are held fixed across many calls.
+
+        Returns
+        -------
+        F_total : torch.Tensor
+            Scalar tensor containing the total free energy
+        """
+        # Get order parameters (projected to satisfy physical constraints)
+        delta_phi = self._get_order_parameter(delta_phi)
+
+        # Get current Gamma_ij
+        if Gamma_ij is None:
+            if self.optimize_box:
+                K2 = self._compute_K2(self.L)
+                Gamma_ij = self._compute_gamma_ij(K2)
+            else:
+                Gamma_ij = self._Gamma_ij_cached
+
+        # Compute interaction energy in Fourier space
+        Delta_F_int = self._compute_interaction_energy(delta_phi, Gamma_ij)
+
+        # Compute mixing entropy terms in real space
+        F_mixing = self._compute_mixing_entropy(delta_phi)
+        F_mixing_2 = self._compute_mixing_entropy_quadratic(delta_phi)
+
+        # Total free energy
+        F_total = Delta_F_int + F_mixing - F_mixing_2
+
+        return F_total
+
+    def _compute_interaction_energy(
+        self, delta_phi: torch.Tensor, Gamma_ij: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the interaction energy Delta F_int in Fourier space.
+
+        Delta F_int = (1/2N) sum_{k != 0} Gamma_ij(k) * phi_i(k) * phi_j(-k)
+
+        Parameters
+        ----------
+        delta_phi : torch.Tensor
+            Order parameters for all components, shape (n_components, *grid_shape)
+        Gamma_ij : torch.Tensor
+            Vertex function, shape (*grid_shape, n_components, n_components)
+
+        Returns
+        -------
+        Delta_F_int : torch.Tensor
+            Scalar interaction energy
+        """
+        # N-dimensional Fourier transform over spatial dims
+        phi_hat = torch.fft.fftn(delta_phi, dim=self.spatial_dims)
+
+        # Move component dim to last: (*grid_shape, n_components)
+        phi_hat = phi_hat.movedim(0, -1)
+
+        # Flatten spatial dims for a single batched einsum
+        M = self.n_grid_points
+        n = self.n_components
+        phi_flat = phi_hat.reshape(M, n)
+        Gamma_flat = Gamma_ij.reshape(M, n, n)
+
+        # Quadratic form per k-point
+        Delta_F_int_k = 0.5 * torch.einsum(
+            "mi,mij,mj->m", phi_flat, Gamma_flat, phi_flat.conj()
+        )
+
+        # Normalize: Fourier coefficients c_k = X[k] / n_grid_points,
+        # so per-unit-volume quadratic form picks up 1/n_grid_points^2.
+        # Delta_F_int = (
+        #     (1 / self.N)
+        #     * self.cell_vol
+        #     / self.n_grid_points
+        #     / self.vol
+        #     * Delta_F_int_k.sum()
+        # ).real
+
+        Delta_F_int = Delta_F_int_k.sum().real / self.n_grid_points**2
+
+        return Delta_F_int
+
+    def _compute_mixing_entropy(self, delta_phi: torch.Tensor) -> torch.Tensor:
+        """
+        Compute the mixing entropy (Flory-Huggins reference free energy).
+
+        F_mixing = (1/NV) sum_i integral phi_i(r) / f_i * ln(phi_i(r)) dr
+
+        Parameters
+        ----------
+        delta_phi : torch.Tensor
+            Order parameters for all components, shape (n_components, *grid_shape)
+
+        Returns
+        -------
+        F_mixing : torch.Tensor
+            Scalar mixing entropy
+        """
+        f_expanded = self._f_expanded()
+        rho = delta_phi + f_expanded * self.phi_bar
+
+        integrand = rho / f_expanded * torch.log(rho)
+        # F_mixing = (1 / self.N) * (1 / self.vol) * integrand.sum() * self.cell_vol
+        F_mixing = (1 / self.vol) * integrand.sum() * self.cell_vol
+
+        return F_mixing
+
+    def _compute_mixing_entropy_quadratic(
+        self, delta_phi: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute the 2nd order expansion of mixing entropy F_mix^(2).
+
+        The entropy integrand is h(delta) = (rho/f)*ln(rho) where rho = f*phi_bar + delta.
+        Its second derivative at delta=0 is h''(0) = 1/(f^2 * phi_bar), giving:
+
+        F_mix^(2) = (1/NV) sum_i integral (delta_phi_i)^2 / (2 * f_i^2 * phi_bar) dr
+
+        This quadratic term is subtracted to avoid double-counting with the
+        ideal chain contribution already in Gamma_ideal.
+
+        Parameters
+        ----------
+        delta_phi : torch.Tensor
+            Order parameters for all components, shape (n_components, *grid_shape)
+
+        Returns
+        -------
+        F_mixing_2 : torch.Tensor
+            Scalar quadratic mixing entropy
+        """
+        f_expanded = self._f_expanded()
+
+        integrand = delta_phi**2 / (2 * f_expanded**2 * self.phi_bar)
+        # F_mixing_2 = (1 / self.N) * (1 / self.vol) * integrand.sum() * self.cell_vol
+        F_mixing_2 = (1 / self.vol) * integrand.sum() * self.cell_vol
+
+        return F_mixing_2
+
+    def get_densities(self, delta_phi: torch.Tensor | None = None) -> torch.Tensor:
+        """
+        Get the current density profiles from order parameters.
+
+        Enforces local incompressibility exactly: rho_0 + ... + rho_{n-1} = phi_bar
+        at every point. The first n_components-1 densities are computed as
+        rho_i = phi_i + f_i*phi_bar; the last is rho_last = phi_bar - sum(rho_i)
+        so the sum is exact (no floating-point drift).
+
+        Returns
+        -------
+        rho : torch.Tensor
+            Density profiles for all components, shape (n_components, *grid_shape)
+        """
+        with torch.no_grad():
+            delta_phi = self._get_order_parameter(delta_phi)
+            f_expanded = self._f_expanded()
+            rho = delta_phi + f_expanded * self.phi_bar
+            n = self.n_components
+            rho = torch.cat(
+                [rho[: n - 1], (self.phi_bar - rho[: n - 1].sum(dim=0, keepdim=True))],
+                dim=0,
+            )
+        return rho
+
+    def get_order_parameters(
+        self, delta_phi: torch.Tensor | None = None
+    ) -> torch.Tensor:
+        """
+        Get the current order parameters (constraints enforced).
+
+        Returns
+        -------
+        delta_phi : torch.Tensor
+            Order parameters for all components, shape (n_components, *grid_shape)
+        """
+        with torch.no_grad():
+            projected = self._get_order_parameter(delta_phi)
+        return projected.detach().clone()
+
+    def get_energy_components(
+        self, delta_phi: torch.Tensor | None = None
+    ) -> dict[str, torch.Tensor]:
+        """
+        Get individual energy components for analysis.
+
+        Returns
+        -------
+        dict with keys 'Delta_F_int', 'F_mixing', 'F_mixing_2', 'F_total'
+        """
+        with torch.no_grad():
+            delta_phi = self._get_order_parameter(delta_phi)
+
+            if self.optimize_box:
+                K2 = self._compute_K2(self.L)
+                Gamma_ij = self._compute_gamma_ij(K2)
+            else:
+                Gamma_ij = self._Gamma_ij_cached
+
+            Delta_F_int = self._compute_interaction_energy(delta_phi, Gamma_ij)
+            F_mixing = self._compute_mixing_entropy(delta_phi)
+            F_mixing_2 = self._compute_mixing_entropy_quadratic(delta_phi)
+            F_total = Delta_F_int + F_mixing - F_mixing_2
+
+        return {
+            "Delta_F_int": Delta_F_int,
+            "F_mixing": F_mixing,
+            "F_mixing_2": F_mixing_2,
+            "F_total": F_total,
+        }
+
+    def check_constraints(
+        self, delta_phi: torch.Tensor | None = None
+    ) -> dict[str, float]:
+        """
+        Check that physical constraints are satisfied.
+
+        Returns
+        -------
+        dict with constraint violation metrics:
+            - 'phi_means': mean of each component (should all be ~0)
+            - 'incompressibility_max_error': max |sum(rho_i) - phi_bar|
+        """
+        with torch.no_grad():
+            delta_phi = self._get_order_parameter(delta_phi)
+            rho = self.get_densities(delta_phi)
+
+            phi_means = [delta_phi[i].mean().item() for i in range(self.n_components)]
+            incomp_error = (rho.sum(dim=0) - self.phi_bar).abs().max().item()
+
+            return {
+                "phi_means": phi_means,
+                "incompressibility_max_error": incomp_error,
+            }
+
+    def gradient_wrt_input(
+        self, delta_phi: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Compute free energy and gradient dF/d(delta_phi) for an input field.
+
+        Parameters
+        ----------
+        delta_phi : torch.Tensor
+            Input order parameter, shape (n_components, *grid_shape)
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            (free_energy, gradient) where gradient has same shape as input
+        """
+        delta_phi_var = delta_phi.clone().detach().requires_grad_(True)
+        F_total = self.forward(delta_phi_var)
+        grad = torch.autograd.grad(F_total, delta_phi_var)[0]
+        return F_total, grad
+
+    def get_box_dimensions(self) -> dict[str, float | list[float]]:
+        """
+        Get current box dimensions.
+
+        Returns
+        -------
+        dict with 'L' (list), 'spacing' (list), 'vol' (float),
+              'grid_shape', and 'ndim'
+        """
+        with torch.no_grad():
+            return {
+                "L": self.L.tolist(),
+                "spacing": self.spacing.tolist(),
+                "vol": self.vol.item(),
+                "grid_shape": list(self.grid_shape),
+                "ndim": self.ndim,
+            }
