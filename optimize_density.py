@@ -24,11 +24,7 @@ import torch
 import torch.nn as nn
 from dataclasses import dataclass, field
 from typing import Optional, Callable
-from gen_initial_conditions import (
-    generate_initial_hexagonal_ordered_structure,
-    generate_hexagonal_A_in_BC_matrix,
-)
-from rpa_torch import BlockCopolymerFreeEnergy
+from rpa import BlockCopolymerFreeEnergy
 
 
 @dataclass
