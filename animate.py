@@ -46,11 +46,14 @@ def main():
     with h5py.File(args.input, "r") as f:
         block_fractions = f.attrs["block_fractions"]
         n_components = f.attrs["n_components"]
+        box_lengths = f["box_lengths"][:]
         t = f["t"][:]
         F = f["F"][:]
         phi = f["phi"][:]
 
     n_frames = phi.shape[0]
+    Lx = box_lengths[0] * 2
+    Ly = box_lengths[1] * 2
 
     # Pre-compute all dominant-component maps
     dom = np.stack(
@@ -66,7 +69,12 @@ def main():
     fig.subplots_adjust(wspace=0.35)
 
     im = ax_img.imshow(
-        dom[0], cmap="tab10", vmin=0, vmax=n_components - 1, interpolation="nearest"
+        dom[0],
+        cmap="tab10",
+        vmin=0,
+        vmax=n_components - 1,
+        interpolation="nearest",
+        extent=[0, Ly, 0, Lx],
     )
     ax_img.set_xticks([])
     ax_img.set_yticks([])
