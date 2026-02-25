@@ -1,3 +1,4 @@
+# Python 
 __pycache__/
 *.pyc
 *.pyo
@@ -8,9 +9,18 @@ __pycache__/
 *.pyzw
 *.pyzwz
 *.pyzwzw
-*.pyzwzwz
 *.pyzwzwzw
+*.pyzwzwzwzw
+*.pyzwzwzwzwzw
 
+# macOS
 .DS_Store
-.cursor
-.pytest_cache/
+
+# datafiles
+*.pt 
+*.h5 
+
+
+# Other
+.venv
+visualizations/
