@@ -4,6 +4,7 @@ Block Copolymer Free Energy Module with Arbitrary Architectures
 A PyTorch module for computing and optimizing the free energy functional
 of block copolymer systems using the Random Phase Approximation (RPA).
 Supports arbitrary chain architectures through distance matrices.
+Supports 1D, 2D, and 3D spatial grids.
 """
 
 # Fix OpenMP conflict on macOS (must be before importing torch/numpy)
@@ -12,7 +13,6 @@ import os
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-# import numpy as np
 import torch
 import torch.nn as nn
 
@@ -47,18 +47,16 @@ class BlockCopolymerFreeEnergy(nn.Module):
         chi_ij represents the interaction between species i and j
     phi_bar : float
         Mean density of the polymer melt
-    Nx : int
-        Number of grid points in x direction
-    Ny : int
-        Number of grid points in y direction
-    dx : float, optional
-        Grid spacing in x direction (default: b/2)
-    dy : float, optional
-        Grid spacing in y direction (default: b/2)
+    grid_shape : tuple of int
+        Number of grid points along each spatial dimension.
+        E.g. (128,) for 1D, (64, 64) for 2D, (32, 32, 32) for 3D.
+    box_lengths : tuple of float, optional
+        Box lengths along each spatial dimension (same length as grid_shape).
+        Defaults to grid_shape[i] * b/2 for each dimension.
     init_amplitude : float, optional
         Amplitude of random initial fluctuations (default: 0.01)
     optimize_box : bool, optional
-        If True, make the box length a learnable parameter (default: False)
+        If True, make the box lengths learnable parameters (default: False)
     """
 
     def __init__(
@@ -69,10 +67,8 @@ class BlockCopolymerFreeEnergy(nn.Module):
         chi_matrix: torch.Tensor = None,
         l_ij_matrix: torch.Tensor = None,
         phi_bar: float = 1.0,
-        Nx: int = 64,
-        Ny: int = 64,
-        dx: float = None,
-        dy: float = None,
+        grid_shape: tuple[int, ...] = (64, 64),
+        box_lengths: tuple[float, ...] | None = None,
         init_amplitude: float = 0.01,
         optimize_box: bool = False,
     ):
@@ -129,49 +125,57 @@ class BlockCopolymerFreeEnergy(nn.Module):
         chi_tensor = chi_matrix.clone().detach()
         self.register_buffer("chi_matrix", chi_tensor)
 
-        # Grid parameters
-        self.Nx = Nx
-        self.Ny = Ny
-        self._dx_init = dx if dx is not None else b / 2
-        self._dy_init = dy if dy is not None else b / 2
-        self._Lx_init = float(Nx * self._dx_init)
-        self._Ly_init = float(Ny * self._dy_init)
+        # Grid parameters (dimension-agnostic)
+        self.grid_shape = tuple(grid_shape)
+        self.ndim = len(grid_shape)
+        self.n_grid_points = math.prod(grid_shape)
+        # Spatial dims of delta_phi tensor: axes 1..ndim (axis 0 is component)
+        self.spatial_dims = tuple(range(1, self.ndim + 1))
+
+        # Store grid shape as a buffer for convenience in computations
+        self.register_buffer(
+            "_grid_shape_tensor",
+            torch.tensor(grid_shape, dtype=self.real_dtype),
+        )
+
+        # Compute initial box lengths
+        if box_lengths is not None:
+            if len(box_lengths) != self.ndim:
+                raise ValueError(
+                    f"box_lengths must have {self.ndim} entries to match "
+                    f"grid_shape {grid_shape}, got {len(box_lengths)}"
+                )
+            self._L_init = tuple(float(v) for v in box_lengths)
+        else:
+            self._L_init = tuple(float(n * b / 2) for n in grid_shape)
 
         # Box optimization flag
         self.optimize_box = optimize_box
 
         if optimize_box:
-            # Learnable box length parameters (use log for numerical stability)
-            self.log_Lx = nn.Parameter(
-                torch.tensor(math.log(self._Lx_init), dtype=self.real_dtype)
-            )
-            self.log_Ly = nn.Parameter(
-                torch.tensor(math.log(self._Ly_init), dtype=self.real_dtype)
+            self.log_L = nn.Parameter(
+                torch.tensor([math.log(v) for v in self._L_init], dtype=self.real_dtype)
             )
         else:
-            # Fixed box length (not learnable)
             self.register_buffer(
-                "_log_Lx_fixed",
-                torch.tensor(math.log(self._Lx_init), dtype=self.real_dtype),
-            )
-            self.register_buffer(
-                "_log_Ly_fixed",
-                torch.tensor(math.log(self._Ly_init), dtype=self.real_dtype),
+                "_log_L_fixed",
+                torch.tensor(
+                    [math.log(v) for v in self._L_init], dtype=self.real_dtype
+                ),
             )
 
-        # Pre-compute k-space grid structure (normalized frequencies, independent of L)
-        kx_norm = torch.fft.fftfreq(Nx, dtype=self.real_dtype)
-        ky_norm = torch.fft.fftfreq(Ny, dtype=self.real_dtype)
-        KX_norm, KY_norm = torch.meshgrid(kx_norm, ky_norm, indexing="ij")
-        self.register_buffer("KX_norm", KX_norm)
-        self.register_buffer("KY_norm", KY_norm)
+        # Pre-compute 1D normalized frequency vectors for each spatial axis
+        for d, n in enumerate(grid_shape):
+            freq = torch.fft.fftfreq(n, dtype=self.real_dtype)
+            self.register_buffer(f"_kfreq_{d}", freq)
 
         # Register architecture distance matrix
         self.register_buffer("l_ij_matrix", l_ij_matrix.clone().detach())
 
         # Pre-compute and cache Gamma_ij if box is not optimized
         if not optimize_box:
-            K2 = self._compute_K2(self._Lx_init, self._Ly_init)
+            L_init_tensor = torch.tensor(self._L_init, dtype=self.real_dtype)
+            K2 = self._compute_K2(L_init_tensor)
             Gamma_ij = self._compute_gamma_ij(K2)
             self.register_buffer("_Gamma_ij_cached", Gamma_ij)
 
@@ -179,63 +183,72 @@ class BlockCopolymerFreeEnergy(nn.Module):
         # for all components. Constraints are enforced through projection
         # in _project_order_parameter.
         delta_phi_init = (
-            torch.randn(self.n_components, Nx, Ny, dtype=self.real_dtype)
+            torch.randn(self.n_components, *grid_shape, dtype=self.real_dtype)
             * init_amplitude
         )
         delta_phi_init = delta_phi_init - delta_phi_init.mean(
-            dim=(-2, -1), keepdim=True
+            dim=self.spatial_dims, keepdim=True
         )
         delta_phi_init = delta_phi_init - delta_phi_init.mean(dim=0, keepdim=True)
         self.delta_phi = nn.Parameter(delta_phi_init)
 
+    # ------------------------------------------------------------------
+    # Properties
+    # ------------------------------------------------------------------
+
     @property
-    def Lx(self) -> torch.Tensor:
-        """Get current box length in x direction."""
+    def L(self) -> torch.Tensor:
+        """Get current box lengths, shape (ndim,)."""
         if self.optimize_box:
-            return torch.exp(self.log_Lx)
+            return torch.exp(self.log_L)
         else:
-            return torch.exp(self._log_Lx_fixed)
+            return torch.exp(self._log_L_fixed)
 
     @property
-    def Ly(self) -> torch.Tensor:
-        """Get current box length in y direction."""
-        if self.optimize_box:
-            return torch.exp(self.log_Ly)
-        else:
-            return torch.exp(self._log_Ly_fixed)
+    def spacing(self) -> torch.Tensor:
+        """Get current grid spacings, shape (ndim,)."""
+        return self.L / self._grid_shape_tensor
 
     @property
-    def dx(self) -> torch.Tensor:
-        """Get current grid spacing in x direction."""
-        return self.Lx / self.Nx
-
-    @property
-    def dy(self) -> torch.Tensor:
-        """Get current grid spacing in y direction."""
-        return self.Ly / self.Ny
+    def cell_vol(self) -> torch.Tensor:
+        """Get volume of a single grid cell (product of spacings)."""
+        return self.spacing.prod()
 
     @property
     def vol(self) -> torch.Tensor:
-        """Get current box volume (area in 2D)."""
-        return self.Lx * self.Ly
+        """Get current box volume (product of all box lengths)."""
+        return self.L.prod()
 
-    def _compute_K2(self, Lx: torch.Tensor, Ly: torch.Tensor) -> torch.Tensor:
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _f_expanded(self) -> torch.Tensor:
+        """Return f_vec reshaped for broadcasting over spatial dims: (n, 1, ..., 1)."""
+        return self.f_vec.view(-1, *([1] * self.ndim))
+
+    def _compute_K2(self, L: torch.Tensor) -> torch.Tensor:
         """
-        Compute k-space grid K2 = kx^2 + ky^2 for given box dimensions.
+        Compute k-space grid K2 = sum_d k_d^2 for given box dimensions.
 
         Parameters
         ----------
-        Lx, Ly : torch.Tensor
-            Box lengths in x and y directions
+        L : torch.Tensor
+            Box lengths, shape (ndim,)
 
         Returns
         -------
         K2 : torch.Tensor
-            k-squared grid of shape (Nx, Ny)
+            k-squared grid of shape (*grid_shape)
         """
-        kx = 2 * torch.pi * self.KX_norm * self.Nx / Lx
-        ky = 2 * torch.pi * self.KY_norm * self.Ny / Ly
-        return kx**2 + ky**2
+        K2 = torch.zeros(self.grid_shape, dtype=self.real_dtype, device=L.device)
+        for d in range(self.ndim):
+            freq = getattr(self, f"_kfreq_{d}")
+            k_d = 2 * math.pi * freq * self.grid_shape[d] / L[d]
+            shape = [1] * self.ndim
+            shape[d] = self.grid_shape[d]
+            K2 = K2 + k_d.view(shape) ** 2
+        return K2
 
     def _compute_gamma_ij(self, K2: torch.Tensor) -> torch.Tensor:
         """
@@ -249,26 +262,26 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Parameters
         ----------
         K2 : torch.Tensor
-            k-squared grid of shape (Nx, Ny)
+            k-squared grid of shape (*grid_shape)
 
         Returns
         -------
         Gamma_ij : torch.Tensor
-            Vertex function of shape (Nx, Ny, n_components, n_components)
+            Vertex function of shape (*grid_shape, n_components, n_components)
         """
         N, b = self.N, self.b
         n = self.n_components
         f = self.f_vec  # (n,)
         phi_bar = self.phi_bar
+        ndim = self.ndim
 
         # Compute xi parameters for each component: xi_i = N * f_i * b^2 * K2 / 6
-        # Shape: (Nx, Ny, n)
+        # Shape: (*grid_shape, n)
         xi = K2.unsqueeze(-1) * N * f * b**2 / 6
 
         # Numerically stable small-x forms:
         # u(x) = (1 - exp(-x)) / x, u(0) = 1
         # v(x) = 2 * (exp(-x) - 1 + x) / x^2, v(0) = 1
-        # We use short Taylor expansions for tiny x to avoid 0/0 and low-q artifacts.
         eps = 1e-8
         xi_safe = torch.where(xi > eps, xi, torch.ones_like(xi))
         u = torch.where(
@@ -286,31 +299,26 @@ class BlockCopolymerFreeEnergy(nn.Module):
         h_diag = N * f**2 * v
 
         # Compute off-diagonal terms h_ij(q) with distance factors
-        # h_ij = (N * f_i * f_j) / (xi_i * xi_j) * (exp(-xi_i)-1) * (exp(-xi_j)-1) * exp(-l_ij * K2 / 6)
-        # Shape: (Nx, Ny, n, n)
-        u_i = u.unsqueeze(-1)  # (Nx, Ny, n, 1)
-        u_j = u.unsqueeze(-2)  # (Nx, Ny, 1, n)
+        # Shape: (*grid_shape, n, n)
+        u_i = u.unsqueeze(-1)  # (*grid_shape, n, 1)
+        u_j = u.unsqueeze(-2)  # (*grid_shape, 1, n)
 
-        f_i = f.view(1, 1, -1, 1)  # (1, 1, n, 1)
-        f_j = f.view(1, 1, 1, -1)  # (1, 1, 1, n)
+        f_i = f.view(*([1] * ndim), -1, 1)  # (1,...,1, n, 1)
+        f_j = f.view(*([1] * ndim), 1, -1)  # (1,...,1, 1, n)
 
-        # Distance factor: exp(-l_ij * K2 / 6)
-        # l_ij_matrix is (n, n), K2 is (Nx, Ny)
-        K2_expanded = K2.unsqueeze(-1).unsqueeze(-1)  # (Nx, Ny, 1, 1)
+        # Distance factor: exp(-l_ij * N * b^2 * K2 / 6)
+        K2_expanded = K2.unsqueeze(-1).unsqueeze(-1)  # (*grid_shape, 1, 1)
         distance_factor = torch.exp(-self.l_ij_matrix * K2_expanded / 6)
 
         # Off-diagonal Debye terms with stable low-q limit
         h_matrix = N * f_i * f_j * u_i * u_j * distance_factor
 
         # Insert diagonal values
-        # Create identity mask for diagonal
         eye = torch.eye(n, device=K2.device, dtype=torch.bool)
-        eye = eye.view(1, 1, n, n).expand(self.Nx, self.Ny, -1, -1)
+        eye = eye.view(*([1] * ndim), n, n).expand(*self.grid_shape, -1, -1)
 
-        # Expand h_diag to match h_matrix shape for diagonal insertion
-        h_diag_expanded = torch.diag_embed(h_diag)  # (Nx, Ny, n, n)
+        h_diag_expanded = torch.diag_embed(h_diag)  # (*grid_shape, n, n)
 
-        # Combine: use h_diag for diagonal, h_matrix for off-diagonal
         h_full = torch.where(eye, h_diag_expanded, h_matrix)
 
         # Keep the structure factor Hermitian/symmetric before inversion.
@@ -320,20 +328,21 @@ class BlockCopolymerFreeEnergy(nn.Module):
         S_ideal = (phi_bar / N) * h_full
 
         # Handle k=0 mode specially to avoid singular matrix
-        # Set S_ideal[0,0] to identity to make it invertible
-        S_ideal[0, 0] = torch.eye(n, device=K2.device)
+        k0_idx = (0,) * ndim
+        S_ideal[k0_idx] = torch.eye(n, device=K2.device)
 
         # Compute inverse: Gamma^ideal_ij = (S^ideal)^-1
         Gamma_ideal_ij = torch.linalg.inv(S_ideal)
 
-        # Add chi interaction: Gamma_ij = Gamma^ideal_ij + chi_ij
-        Gamma_ij = Gamma_ideal_ij + self.chi_matrix.unsqueeze(0).unsqueeze(0)
+        # Add chi interaction: Gamma_ij = Gamma^ideal_ij - 2*chi_ij
+        chi_expanded = self.chi_matrix.view(*([1] * ndim), n, n)
+        Gamma_ij = Gamma_ideal_ij + chi_expanded
 
         # Convert to complex for Fourier space operations
         Gamma_ij = Gamma_ij.to(self.complex_dtype)
 
         # Zero out k=0 mode (will be excluded from sum anyway)
-        Gamma_ij[0, 0, :, :] = 0
+        Gamma_ij[(*k0_idx, slice(None), slice(None))] = 0
 
         return Gamma_ij
 
@@ -348,21 +357,21 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Parameters
         ----------
         delta_phi : torch.Tensor
-            Input order parameter, shape (n_components, Nx, Ny)
+            Input order parameter, shape (n_components, *grid_shape)
 
         Returns
         -------
         torch.Tensor
             Projected order parameter with same shape as input
         """
-        expected_shape = (self.n_components, self.Nx, self.Ny)
+        expected_shape = (self.n_components, *self.grid_shape)
         if tuple(delta_phi.shape) != expected_shape:
             raise ValueError(
                 f"delta_phi must have shape {expected_shape}, got {tuple(delta_phi.shape)}"
             )
 
-        # Global zero-mean for each component
-        delta_phi = delta_phi - delta_phi.mean(dim=(-2, -1), keepdim=True)
+        # Global zero-mean for each component (average over spatial dims)
+        delta_phi = delta_phi - delta_phi.mean(dim=self.spatial_dims, keepdim=True)
         # Local incompressibility (sum over components equals zero pointwise)
         delta_phi = delta_phi - delta_phi.mean(dim=0, keepdim=True)
         return delta_phi
@@ -390,7 +399,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Parameters
         ----------
         delta_phi : torch.Tensor, optional
-            Order parameter field with shape (n_components, Nx, Ny).
+            Order parameter field with shape (n_components, *grid_shape).
             If None, uses the module's internal learnable `self.delta_phi`.
         Gamma_ij : torch.Tensor, optional
             Pre-computed vertex function. If provided, skips recomputation.
@@ -407,7 +416,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         # Get current Gamma_ij
         if Gamma_ij is None:
             if self.optimize_box:
-                K2 = self._compute_K2(self.Lx, self.Ly)
+                K2 = self._compute_K2(self.L)
                 Gamma_ij = self._compute_gamma_ij(K2)
             else:
                 Gamma_ij = self._Gamma_ij_cached
@@ -435,35 +444,43 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Parameters
         ----------
         delta_phi : torch.Tensor
-            Order parameters for all components, shape (n_components, Nx, Ny)
+            Order parameters for all components, shape (n_components, *grid_shape)
         Gamma_ij : torch.Tensor
-            Vertex function, shape (Nx, Ny, n_components, n_components)
+            Vertex function, shape (*grid_shape, n_components, n_components)
 
         Returns
         -------
         Delta_F_int : torch.Tensor
             Scalar interaction energy
         """
-        # Fourier transform of order parameters: shape (n_components, Nx, Ny)
-        phi_hat = torch.fft.fft2(delta_phi)
+        # N-dimensional Fourier transform over spatial dims
+        phi_hat = torch.fft.fftn(delta_phi, dim=self.spatial_dims)
 
-        # Rearrange to (Nx, Ny, n_components) for einsum
-        phi_hat = phi_hat.permute(1, 2, 0)
+        # Move component dim to last: (*grid_shape, n_components)
+        phi_hat = phi_hat.movedim(0, -1)
 
-        # Compute quadratic form: sum over k of phi_i(k) Gamma_ij(k) phi_j(-k)
-        # Note: phi(-k) = phi(k)^* for real phi
+        # Flatten spatial dims for a single batched einsum
+        M = self.n_grid_points
+        n = self.n_components
+        phi_flat = phi_hat.reshape(M, n)
+        Gamma_flat = Gamma_ij.reshape(M, n, n)
+
+        # Quadratic form per k-point
         Delta_F_int_k = 0.5 * torch.einsum(
-            "xyi,xyij,xyj->xy", phi_hat, Gamma_ij, phi_hat.conj()
+            "mi,mij,mj->m", phi_flat, Gamma_flat, phi_flat.conj()
         )
 
-        # Sum over k-space (k=0 is already zeroed in Gamma_ij)
-        # Normalize by grid factors and include 1/N prefactor
-        Delta_F_int = (
-            (1 / self.N)
-            * (self.dx * self.dy)
-            / (self.Nx * self.Ny)
-            * Delta_F_int_k.sum()
-        ).real
+        # Normalize: Fourier coefficients c_k = X[k] / n_grid_points,
+        # so per-unit-volume quadratic form picks up 1/n_grid_points^2.
+        # Delta_F_int = (
+        #     (1 / self.N)
+        #     * self.cell_vol
+        #     / self.n_grid_points
+        #     / self.vol
+        #     * Delta_F_int_k.sum()
+        # ).real
+
+        Delta_F_int = Delta_F_int_k.sum().real / self.n_grid_points**2
 
         return Delta_F_int
 
@@ -476,26 +493,19 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Parameters
         ----------
         delta_phi : torch.Tensor
-            Order parameters for all components, shape (n_components, Nx, Ny)
+            Order parameters for all components, shape (n_components, *grid_shape)
 
         Returns
         -------
         F_mixing : torch.Tensor
             Scalar mixing entropy
         """
-        # Convert order parameters to volume fractions (densities)
-        # rho_i(r) = phi_i(r) + f_i * phi_bar
-        f_expanded = self.f_vec.view(-1, 1, 1)  # (n, 1, 1)
+        f_expanded = self._f_expanded()
         rho = delta_phi + f_expanded * self.phi_bar
 
-        # Clamp to avoid log of negative numbers during optimization
-        # TODO: check if this is messing with gradients, going to try turning off for now
-        # rho = torch.clamp(rho, min=1e-10)
-
-        # Compute mixing entropy integral with 1/N prefactor
-        # Sum over components and spatial points
         integrand = rho / f_expanded * torch.log(rho)
-        F_mixing = (1 / self.N) * (1 / self.vol) * integrand.sum() * self.dx * self.dy
+        # F_mixing = (1 / self.N) * (1 / self.vol) * integrand.sum() * self.cell_vol
+        F_mixing = (1 / self.vol) * integrand.sum() * self.cell_vol
 
         return F_mixing
 
@@ -505,7 +515,10 @@ class BlockCopolymerFreeEnergy(nn.Module):
         """
         Compute the 2nd order expansion of mixing entropy F_mix^(2).
 
-        F_mix^(2) = (1/NV) sum_i integral (phi_i)^2 / (2 f_i) dr
+        The entropy integrand is h(delta) = (rho/f)*ln(rho) where rho = f*phi_bar + delta.
+        Its second derivative at delta=0 is h''(0) = 1/(f^2 * phi_bar), giving:
+
+        F_mix^(2) = (1/NV) sum_i integral (delta_phi_i)^2 / (2 * f_i^2 * phi_bar) dr
 
         This quadratic term is subtracted to avoid double-counting with the
         ideal chain contribution already in Gamma_ideal.
@@ -513,18 +526,18 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Parameters
         ----------
         delta_phi : torch.Tensor
-            Order parameters for all components, shape (n_components, Nx, Ny)
+            Order parameters for all components, shape (n_components, *grid_shape)
 
         Returns
         -------
         F_mixing_2 : torch.Tensor
             Scalar quadratic mixing entropy
         """
-        f_expanded = self.f_vec.view(-1, 1, 1)  # (n, 1, 1)
+        f_expanded = self._f_expanded()
 
-        # Compute quadratic term
-        integrand = delta_phi**2 / (2 * f_expanded)
-        F_mixing_2 = (1 / self.N) * (1 / self.vol) * integrand.sum() * self.dx * self.dy
+        integrand = delta_phi**2 / (2 * f_expanded**2 * self.phi_bar)
+        # F_mixing_2 = (1 / self.N) * (1 / self.vol) * integrand.sum() * self.cell_vol
+        F_mixing_2 = (1 / self.vol) * integrand.sum() * self.cell_vol
 
         return F_mixing_2
 
@@ -540,13 +553,12 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Returns
         -------
         rho : torch.Tensor
-            Density profiles for all components, shape (n_components, Nx, Ny)
+            Density profiles for all components, shape (n_components, *grid_shape)
         """
         with torch.no_grad():
             delta_phi = self._get_order_parameter(delta_phi)
-            f_expanded = self.f_vec.view(-1, 1, 1)
+            f_expanded = self._f_expanded()
             rho = delta_phi + f_expanded * self.phi_bar
-            # Enforce exact incompressibility: last component = phi_bar - sum(others)
             n = self.n_components
             rho = torch.cat(
                 [rho[: n - 1], (self.phi_bar - rho[: n - 1].sum(dim=0, keepdim=True))],
@@ -563,7 +575,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Returns
         -------
         delta_phi : torch.Tensor
-            Order parameters for all components, shape (n_components, Nx, Ny)
+            Order parameters for all components, shape (n_components, *grid_shape)
         """
         with torch.no_grad():
             projected = self._get_order_parameter(delta_phi)
@@ -583,7 +595,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
             delta_phi = self._get_order_parameter(delta_phi)
 
             if self.optimize_box:
-                K2 = self._compute_K2(self.Lx, self.Ly)
+                K2 = self._compute_K2(self.L)
                 Gamma_ij = self._compute_gamma_ij(K2)
             else:
                 Gamma_ij = self._Gamma_ij_cached
@@ -633,7 +645,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Parameters
         ----------
         delta_phi : torch.Tensor
-            Input order parameter, shape (n_components, Nx, Ny)
+            Input order parameter, shape (n_components, *grid_shape)
 
         Returns
         -------
@@ -645,19 +657,20 @@ class BlockCopolymerFreeEnergy(nn.Module):
         grad = torch.autograd.grad(F_total, delta_phi_var)[0]
         return F_total, grad
 
-    def get_box_dimensions(self) -> dict[str, float]:
+    def get_box_dimensions(self) -> dict[str, float | list[float]]:
         """
         Get current box dimensions.
 
         Returns
         -------
-        dict with 'Lx', 'Ly', 'dx', 'dy', 'vol'
+        dict with 'L' (list), 'spacing' (list), 'vol' (float),
+              'grid_shape', and 'ndim'
         """
         with torch.no_grad():
             return {
-                "Lx": self.Lx.item(),
-                "Ly": self.Ly.item(),
-                "dx": self.dx.item(),
-                "dy": self.dy.item(),
+                "L": self.L.tolist(),
+                "spacing": self.spacing.tolist(),
                 "vol": self.vol.item(),
+                "grid_shape": list(self.grid_shape),
+                "ndim": self.ndim,
             }
