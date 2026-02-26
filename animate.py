@@ -15,6 +15,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter, FFMpegWriter
 
+from simulation_io import SimulationData
+
 
 def compute_dominant_component(
     delta_phi: np.ndarray, block_fractions: np.ndarray
@@ -43,17 +45,19 @@ def main():
     )
     args = parser.parse_args()
 
-    with h5py.File(args.input, "r") as f:
-        block_fractions = f.attrs["block_fractions"]
-        n_components = f.attrs["n_components"]
-        box_lengths = f["box_lengths"][:]
-        t = f["t"][:]
-        F = f["F"][:]
-        phi = f["phi"][:]
+    data = SimulationData.from_hdf5(args.input)
+    block_fractions = data.block_fractions
+    n_components = data.n_components
+    box_lengths = data.box_lengths  # (n_frames, ndim)
+    F = data.F
+    phi = data.phi
 
-    n_frames = phi.shape[0]
-    Lx = box_lengths[0] * 2
-    Ly = box_lengths[1] * 2
+    with h5py.File(args.input, "r") as f:
+        t = f["t"][:] if "t" in f else np.arange(data.n_frames, dtype=np.float64)
+
+    n_frames = data.n_frames
+    Lx = box_lengths[0, 0] * 2
+    Ly = box_lengths[0, 1] * 2
 
     # Pre-compute all dominant-component maps
     dom = np.stack(

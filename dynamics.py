@@ -4,7 +4,7 @@ Cahn-Hilliard (Model B) Dynamics Solver for Block Copolymer Systems
 
 Time-evolution solver using the conserved-order-parameter equation of motion:
 
-    ∂δφ_i/∂t = M ∇² μ̃_i
+    ∂δφ_i/∂t = -M ∇² μ̃_i
 
 where μ̃_i is the exchange chemical potential (incompressibility-enforcing)
 and M is the mobility coefficient.
@@ -331,7 +331,9 @@ def simulate(
     elif method == "forward-euler":
         step_fn = forward_euler_step
     else:
-        raise ValueError(f"Unknown method: {method}. Use 'semi-implicit' or 'forward-euler'.")
+        raise ValueError(
+            f"Unknown method: {method}. Use 'semi-implicit' or 'forward-euler'."
+        )
 
     result = SimulationResult()
 
@@ -340,7 +342,9 @@ def simulate(
         F0 = model(delta_phi, Gamma_ij=Gamma_ij).item()
     result.F_history.append(F0)
     result.t_history.append(0.0)
-    result.conservation_error.append(delta_phi.mean(dim=model.spatial_dims).abs().max().item())
+    result.conservation_error.append(
+        delta_phi.mean(dim=model.spatial_dims).abs().max().item()
+    )
     result.incompressibility_error.append(delta_phi.sum(dim=0).abs().max().item())
 
     if log_every > 0:
@@ -377,8 +381,10 @@ def simulate(
         f_expanded = model._f_expanded()
         rho = delta_phi + f_expanded * model.phi_bar
         if rho.min().item() < 0:
-            print(f"WARNING: Negative density at step {step} (min rho = {rho.min().item():.4e}). "
-                  f"Consider reducing dt.")
+            print(
+                f"WARNING: Negative density at step {step} (min rho = {rho.min().item():.4e}). "
+                f"Consider reducing dt."
+            )
             break
 
     result.n_steps_completed = step
@@ -461,7 +467,9 @@ if __name__ == "__main__":
     # With q_max^2 ~ 1000 and ||Gamma|| ~ 900, we need dt ~ 1e-6.
     small_dt = 1e-6
     n_compare = 100
-    print(f"\n--- Forward Euler vs Semi-implicit (dt={small_dt}, {n_compare} steps) ---")
+    print(
+        f"\n--- Forward Euler vs Semi-implicit (dt={small_dt}, {n_compare} steps) ---"
+    )
     delta_phi_init2 = model._project_order_parameter(model.delta_phi.data.clone())
     result_fe = simulate(
         model,
@@ -487,9 +495,13 @@ if __name__ == "__main__":
 
     print(f"  Forward Euler F = {result_fe.F_history[-1]:.10e}")
     print(f"  Semi-implicit F = {result_si_small.F_history[-1]:.10e}")
-    print(f"  ΔF difference   = {abs(result_fe.F_history[-1] - result_si_small.F_history[-1]):.4e}")
+    print(
+        f"  ΔF difference   = {abs(result_fe.F_history[-1] - result_si_small.F_history[-1]):.4e}"
+    )
 
-    diff_norm = (result_fe.final_delta_phi - result_si_small.final_delta_phi).norm().item()
+    diff_norm = (
+        (result_fe.final_delta_phi - result_si_small.final_delta_phi).norm().item()
+    )
     field_norm = result_fe.final_delta_phi.norm().item()
     rel_diff = diff_norm / max(field_norm, 1e-15)
     print(f"  Field difference (L2 relative) = {rel_diff:.4e}")

@@ -17,18 +17,27 @@ Usage
 
 import argparse
 
-import h5py
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FFMpegWriter, FuncAnimation, PillowWriter
 
+from simulation_io import SimulationData
+
 
 def compute_dominant_component(
     delta_phi: np.ndarray, block_fractions: np.ndarray
-) -> np.ndarray:
-    """Return the index of the locally dominant species at every grid point."""
+) -> tuple[np.ndarray, np.ndarray]:
     rho = delta_phi + block_fractions[:, np.newaxis, np.newaxis]
-    return np.argmax(rho, axis=0)
+    dominant_component = np.argmax(rho, axis=0)
+    # Works for any spatial dimensionality (1D, 2D, 3D)
+    spatial_shape = dominant_component.shape
+    flat_dom = dominant_component.ravel()
+    flat_rho = rho.reshape(rho.shape[0], -1)
+    dominant_rho = flat_rho[flat_dom, np.arange(flat_dom.size)].reshape(spatial_shape)
+    alpha = (dominant_rho - dominant_rho.min()) / (
+        dominant_rho.max() - dominant_rho.min() + 1e-12
+    )
+    return dominant_component, alpha
 
 
 def main():
@@ -63,24 +72,25 @@ def main():
     # ------------------------------------------------------------------
     # Load trajectory
     # ------------------------------------------------------------------
-    with h5py.File(args.input, "r") as f:
-        block_fractions = np.array(f.attrs["block_fractions"])
-        n_components = int(f.attrs["n_components"])
-        outer_idx = f["outer_idx"][:]  # (n_frames,)
-        box_lengths = f["box_lengths"][:]  # (n_frames, ndim)
-        F_after_box = f["F_after_box"][:]  # (n_frames,)
-        phi = f["phi"][:]  # (n_frames, n_comp, Nx, Ny)
+    data = SimulationData.from_hdf5(args.input)
+    block_fractions = data.block_fractions
+    box_lengths = data.box_lengths
+    F_values = data.F
+    phi = data.phi
 
-    n_frames = phi.shape[0]
+    n_frames = data.n_frames
     n_tile = 1 if args.no_tile else 2
 
     # Pre-compute dominant-component maps for all frames
     dom_frames = []
+    alpha_frames = []
     for i in range(n_frames):
-        d = compute_dominant_component(phi[i], block_fractions)
+        d, alpha = compute_dominant_component(phi[i], block_fractions)
         if n_tile > 1:
             d = np.tile(d, (n_tile, n_tile))
+            alpha = np.tile(alpha, (n_tile, n_tile))
         dom_frames.append(d)
+        alpha_frames.append(alpha)
 
     # ------------------------------------------------------------------
     # Figure setup
@@ -103,16 +113,17 @@ def main():
         dom_frames[0],
         cmap="tab10",
         vmin=0,
-        vmax=n_components - 1,
+        vmax=10,
         interpolation="nearest",
         origin="lower",
         extent=[0, Lx0, 0, Ly0],
+        alpha=alpha_frames[0],
     )
     ax.set_xlim(0, Lx0)
     ax.set_ylim(0, Ly0)
 
     title = ax.set_title(
-        _frame_title(outer_idx[0], box_lengths[0], F_after_box[0]),
+        _frame_title(0, box_lengths[0], F_values[0]),
         fontsize=10,
     )
 
@@ -124,10 +135,11 @@ def main():
         Ly_i = box_lengths[i, 1] * n_tile
 
         im.set_data(dom_frames[i])
+        im.set_alpha(alpha_frames[i])
         im.set_extent([0, Lx_i, 0, Ly_i])
         ax.set_xlim(0, Lx_i)
         ax.set_ylim(0, Ly_i)
-        title.set_text(_frame_title(outer_idx[i], box_lengths[i], F_after_box[i]))
+        title.set_text(_frame_title(i, box_lengths[i], F_values[i]))
         return (im, title)
 
     # blit=False because axes geometry changes each frame
@@ -153,9 +165,9 @@ def main():
         plt.show()
 
 
-def _frame_title(outer: int, box: np.ndarray, F: float) -> str:
+def _frame_title(frame: int, box: np.ndarray, F: float) -> str:
     Lx, Ly = box[0], box[1]
-    return f"Outer {outer}   Lx={Lx:.3f}  Ly={Ly:.3f}   F={F:.6f}"
+    return f"Frame {frame}   Lx={Lx:.3f}  Ly={Ly:.3f}   F={F:.6f}"
 
 
 if __name__ == "__main__":

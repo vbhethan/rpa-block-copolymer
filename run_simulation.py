@@ -31,6 +31,7 @@ import numpy as np
 import torch
 
 from dynamics import forward_euler_step, semi_implicit_step
+from simulation_io import SimulationData
 from rpa import BlockCopolymerFreeEnergy
 
 
@@ -168,16 +169,19 @@ def _run(
 
 def _save_hdf5(path: str, result: dict, model: BlockCopolymerFreeEnergy, args) -> None:
     """Write simulation result and metadata to an HDF5 file."""
-    with h5py.File(path, "w") as f:
-        # --- simulation metadata ---
-        f.attrs["system"] = "3-component symmetric star copolymer"
-        f.attrs["N"] = model.N
-        f.attrs["b"] = model.b
-        f.attrs["n_components"] = model.n_components
-        f.attrs["block_fractions"] = model.f_vec.cpu().numpy()
-        f.attrs["phi_bar"] = model.phi_bar
-        f.attrs["grid_shape"] = list(model.grid_shape)
-        f.attrs["box_lengths"] = model.L.cpu().numpy()
+    data = SimulationData.from_model(model)
+
+    n_frames = len(result["F_frames"])
+    L_np = model.L.detach().cpu().numpy()
+    data.phi = result["phi_frames"]
+    data.F = result["F_frames"]
+    data.box_lengths = np.tile(L_np, (n_frames, 1))
+
+    data.to_hdf5(path)
+
+    # Script-specific provenance attrs (not part of SimulationData schema)
+    kw = {"compression": "gzip", "compression_opts": 4}
+    with h5py.File(path, "a") as f:
         f.attrs["dt"] = args.dt
         f.attrs["M"] = args.M
         f.attrs["method"] = args.method
@@ -187,29 +191,14 @@ def _save_hdf5(path: str, result: dict, model: BlockCopolymerFreeEnergy, args) -
         f.attrs["seed"] = args.seed
         f.attrs["init_amplitude"] = args.amplitude
 
-        # --- system parameter datasets ---
-        kw = {"compression": "gzip", "compression_opts": 4}
-
-        f.create_dataset("chi_matrix", data=model.chi_matrix.cpu().numpy())
-        f.create_dataset("l_ij_matrix", data=model.l_ij_matrix.cpu().numpy())
-        f.create_dataset("box_lengths", data=model.L.cpu().numpy())
-
-        # --- trajectory datasets ---
-
-        # time at each frame
         f.create_dataset("t", data=result["t_frames"], **kw)
-
-        # free energy at each frame
-        f.create_dataset("F", data=result["F_frames"], **kw)
-
-        # order-parameter snapshots: (n_frames, n_components, *grid_shape)
-        ds = f.create_dataset("phi", data=result["phi_frames"], **kw)
-        ds.attrs["axes"] = "frame,component,x,y"
-
-        # constraint diagnostics
-        f.create_dataset("conservation_error", data=result["conservation_error"], **kw)
         f.create_dataset(
-            "incompressibility_error", data=result["incompressibility_error"], **kw
+            "conservation_error", data=result["conservation_error"], **kw
+        )
+        f.create_dataset(
+            "incompressibility_error",
+            data=result["incompressibility_error"],
+            **kw,
         )
 
 
@@ -309,7 +298,7 @@ def main():
     print("=" * 64)
     print("Cahn-Hilliard Forward Simulation")
     print("=" * 64)
-    print(f"  System     : 3-component symmetric star copolymer")
+    # print(f"  System     : 3-component symmetric star copolymer")
     print(f"  Grid       : {args.grid}x{args.grid}  Box: {args.Lx}x{args.Ly}")
     print(f"  chiN = {args.chiN},  N = {N},  M = {args.M}")
     print(f"  Method     : {args.method},  dt = {args.dt}")

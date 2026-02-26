@@ -43,6 +43,7 @@ import numpy as np
 import torch
 
 from dynamics import simulate
+from simulation_io import SimulationData
 from optimize_box import optimize_box_lengths
 from rpa import BlockCopolymerFreeEnergy
 
@@ -270,16 +271,15 @@ def _save_hdf5(
     args,
 ) -> None:
     """Write the optimization trajectory and metadata to an HDF5 file."""
-    with h5py.File(path, "w") as f:
-        # --- root attributes ---
-        f.attrs["system"] = "3-component symmetric star copolymer"
-        f.attrs["N"] = model.N
-        f.attrs["b"] = model.b
-        f.attrs["n_components"] = model.n_components
-        f.attrs["block_fractions"] = model.f_vec.cpu().numpy()
-        f.attrs["phi_bar"] = model.phi_bar
-        f.attrs["grid_shape"] = list(model.grid_shape)
-        f.attrs["initial_box_lengths"] = [args.Lx, args.Ly]
+    data = SimulationData.from_model(model)
+    data.phi = np.stack(result["phi_frames"], axis=0)
+    data.F = np.array(result["F_after_box"], dtype=np.float64)
+    data.box_lengths = np.array(result["L_frames"], dtype=np.float64)
+
+    data.to_hdf5(path)
+
+    # Script-specific provenance attrs (not part of SimulationData schema)
+    with h5py.File(path, "a") as f:
         f.attrs["dt"] = args.dt
         f.attrs["M"] = args.M
         f.attrs["dynamics_method"] = args.method
@@ -294,43 +294,6 @@ def _save_hdf5(
         f.attrs["seed"] = args.seed
         f.attrs["init_amplitude"] = args.amplitude
         f.attrs["converged"] = result["converged"]
-
-        # --- system parameter datasets ---
-        f.create_dataset("chi_matrix", data=model.chi_matrix.cpu().numpy())
-        f.create_dataset("l_ij_matrix", data=model.l_ij_matrix.cpu().numpy())
-
-        # --- trajectory datasets ---
-        kw = {"compression": "gzip", "compression_opts": 4}
-
-        f.create_dataset(
-            "outer_idx",
-            data=np.array(result["outer_idx"], dtype=np.int64),
-        )
-        f.create_dataset(
-            "F_after_dynamics",
-            data=np.array(result["F_after_dynamics"], dtype=np.float64),
-            **kw,
-        )
-        f.create_dataset(
-            "F_after_box",
-            data=np.array(result["F_after_box"], dtype=np.float64),
-            **kw,
-        )
-        # box_lengths varies per frame: (n_frames, ndim)
-        ds = f.create_dataset(
-            "box_lengths",
-            data=np.array(result["L_frames"], dtype=np.float64),
-            **kw,
-        )
-        ds.attrs["axes"] = "frame,spatial_dim"
-
-        # order-parameter snapshots: (n_frames, n_components, Nx, Ny)
-        ds = f.create_dataset(
-            "phi",
-            data=np.stack(result["phi_frames"], axis=0),
-            **kw,
-        )
-        ds.attrs["axes"] = "frame,component,x,y"
 
 
 # ---------------------------------------------------------------------------
@@ -358,7 +321,7 @@ def _parse_args():
     p.add_argument(
         "--tol-F",
         type=float,
-        default=1e-5,
+        default=1e-6,
         help="Outer convergence tolerance on |ΔF| (default: 1e-5)",
     )
     p.add_argument(
@@ -392,13 +355,13 @@ def _parse_args():
     p.add_argument(
         "--n-box-steps",
         type=int,
-        default=10000,
+        default=1000,
         help="Max box-opt gradient steps per outer iteration (default: 10000)",
     )
     p.add_argument(
         "--lr-box",
         type=float,
-        default=1.0,
+        default=0.1,
         help="Box optimization initial step size (default: 1.0)",
     )
     p.add_argument(
@@ -432,6 +395,15 @@ def _parse_args():
     )
     p.add_argument("--seed", type=int, default=42, help="Random seed (default: 42)")
 
+    # restart
+    p.add_argument(
+        "--restart",
+        type=str,
+        default=None,
+        metavar="PATH",
+        help="Resume from the final frame of an existing HDF5 file",
+    )
+
     # logging
     p.add_argument(
         "--log-every",
@@ -447,37 +419,47 @@ def main():
     torch.manual_seed(args.seed)
 
     # --- build system ---
-    N = 100
-    chi_matrix = torch.ones((3, 3), dtype=torch.float64) * args.chiN
-    chi_matrix.fill_diagonal_(0.0)
-    block_fractions = torch.tensor([1 / 3, 1 / 3, 1 / 3], dtype=torch.float64)
-    l_ij_matrix = torch.zeros((3, 3), dtype=torch.float64)
+    if args.restart is not None:
+        print(f"Restarting from {args.restart} (final frame)")
+        sim_data = SimulationData.from_hdf5(args.restart)
+        model = sim_data.build_model(optimize_box=True)
+        initial_box = model.L.detach().cpu().tolist()
+    else:
+        N = 100
+        chi_matrix = torch.ones((3, 3), dtype=torch.float64) * args.chiN
+        chi_matrix.fill_diagonal_(0.0)
+        block_fractions = torch.tensor([1 / 3, 1 / 3, 1 / 3], dtype=torch.float64)
+        l_ij_matrix = torch.zeros((3, 3), dtype=torch.float64)
 
-    model = BlockCopolymerFreeEnergy(
-        N=N,
-        chi_matrix=chi_matrix,
-        l_ij_matrix=l_ij_matrix,
-        block_fractions=block_fractions,
-        phi_bar=1.0,
-        optimize_box=True,
-        grid_shape=(args.grid, args.grid),
-        box_lengths=(args.Lx, args.Ly),
-        init_amplitude=args.amplitude,
-    )
+        model = BlockCopolymerFreeEnergy(
+            N=N,
+            chi_matrix=chi_matrix,
+            l_ij_matrix=l_ij_matrix,
+            block_fractions=block_fractions,
+            phi_bar=1.0,
+            optimize_box=True,
+            grid_shape=(args.grid, args.grid),
+            box_lengths=(args.Lx, args.Ly),
+            init_amplitude=args.amplitude,
+        )
+        initial_box = [args.Lx, args.Ly]
 
     delta_phi_init = model._project_order_parameter(model.delta_phi.data.clone())
 
+    grid_str = "x".join(str(s) for s in model.grid_shape)
+    box_str = "x".join(f"{v:.4f}" for v in initial_box)
     print("=" * 72)
     print("Alternating Dynamics + Box Optimization")
     print("=" * 72)
-    print(f"  System      : 3-component symmetric star copolymer")
-    print(f"  Grid        : {args.grid}x{args.grid}   Initial box: {args.Lx}x{args.Ly}")
-    print(f"  chiN = {args.chiN},  N = {N}")
+    if args.restart:
+        print(f"  Restart from: {args.restart}")
+    print(f"  Grid        : {grid_str}   Initial box: {box_str}")
+    print(f"  chiN = {model.chi_matrix[0, 1].item():.1f},  N = {model.N}")
     print(
-        f"  Dynamics    : {args.method},  dt = {args.dt},  {args.n_dynamics} steps/outer"
+        f"  Dynamics    : {args.method},  dt = {args.dt},  {args.n_dynamics} steps/phase"
     )
-    print(f"  Box opt     : {args.n_box_steps} steps/outer,  lr = {args.lr_box}")
-    print(f"  Outer iters : {args.n_outer}  (save every {args.save_every})")
+    print(f"  Box opt     : {args.n_box_steps} steps/phase,  lr = {args.lr_box}")
+    print(f"  Iterations  : {args.n_outer}  (save every {args.save_every})")
     print(f"  Output      : {args.output}")
     print()
 
@@ -503,22 +485,22 @@ def main():
     print("=" * 72)
     print("Summary")
     print("=" * 72)
-    print(f"  Outer iterations completed : {result['n_outer_completed']}")
-    print(f"  Converged                  : {result['converged']}")
+    print(f"  Iterations completed : {result['n_outer_completed']}")
+    print(f"  Converged            : {result['converged']}")
     print(f"  F initial : {result['F_initial']:.10e}")
     print(f"  F final   : {result['F_final']:.10e}")
     print(f"  delta_F   : {result['F_final'] - result['F_initial']:.4e}")
     print()
-    for d, (L0, Lf) in enumerate(zip([args.Lx, args.Ly], result["L_final"])):
+    for d, (L0, Lf) in enumerate(zip(initial_box, result["L_final"])):
         print(f"  L{d}: {L0:.6f}  ->  {Lf:.6f}   ({(Lf / L0 - 1) * 100:+.3f} %)")
 
     print(f"\nSaving to {args.output} ...")
     _save_hdf5(args.output, result, model, args)
     n_frames = len(result["outer_idx"])
     print(
-        f"  phi shape        : ({n_frames}, {model.n_components}, {args.grid}, {args.grid})"
+        f"  phi shape        : ({n_frames}, {model.n_components}, {', '.join(str(s) for s in model.grid_shape)})"
     )
-    print(f"  box_lengths shape: ({n_frames}, {model.ndim})  ← varies per frame")
+    print(f"  box_lengths shape: ({n_frames}, {model.ndim})")
     print(f"  Frames saved     : {n_frames}")
     print(f"\nDone. Written to: {args.output}")
 
