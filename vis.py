@@ -6,6 +6,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from rpa import BlockCopolymerFreeEnergy
 from simulation_io import SimulationData
+from glob import glob
 
 
 def load_delta_phi(filename: str) -> torch.Tensor:
@@ -31,8 +32,9 @@ def compute_dominant_component(rho: np.ndarray) -> tuple[np.ndarray, np.ndarray]
     return dominant_component, alpha
 
 
-if __name__ == "__main__":
-    result = SimulationData.from_hdf5("optimization_result.h5")
+def plot_simulation_result(
+    result: SimulationData, fig: plt.Figure = None, ax: plt.Axes = None
+) -> tuple[plt.Figure, plt.Axes]:
     delta_phi = result.phi[-1]
     block_fractions = result.block_fractions
     rho = delta_phi + block_fractions[:, np.newaxis, np.newaxis]
@@ -43,16 +45,18 @@ if __name__ == "__main__":
     chi_matrix = model.chi_matrix.detach().numpy().flatten()
     block_id = "_".join([f"{v:.3f}" for v in block_fractions.tolist()])
     chi_id = "_".join([f"{v:.3f}" for v in chi_matrix.tolist()])
-    id_string = f"f_{block_id}_chi_{chi_id}"
     n_tiles = 3
 
     Lx = result.box_lengths[-1][0]
     Ly = result.box_lengths[-1][1]
 
+    if fig is None:
+        fig, ax = plt.subplots()
+
     dominant_component, alpha = compute_dominant_component(rho)
     dom_tiled = np.tile(dominant_component, (n_tiles, n_tiles))
     alpha_tiled = np.tile(alpha, (n_tiles, n_tiles))
-    plt.imshow(
+    ax.imshow(
         dom_tiled,
         cmap="tab10",
         alpha=alpha_tiled,
@@ -60,6 +64,42 @@ if __name__ == "__main__":
         vmin=0,
         vmax=10,
     )
-    plt.colorbar()
-    plt.savefig(f"visualizations/vis_{id_string}.png")
+
+
+def generate_annotation_str(result: SimulationData):
+    block_fraction_string = np.array_str(result.block_fractions, precision=3)
+    chi_matrix_string = np.array_str(result.chi_matrix, precision=3)
+    return block_fraction_string, chi_matrix_string
+
+
+def detect_trial_number(id_string: str) -> int:
+    previous_trials = glob(f"visualizations/vis_{id_string}_*.png")
+    if len(previous_trials) == 0:
+        return 0
+    else:
+        return len(previous_trials)
+
+
+if __name__ == "__main__":
+    result = SimulationData.from_hdf5("output.h5")
+    print(result.phi.shape)
+    block_fractions = result.block_fractions.flatten()
+    chi_matrix = result.chi_matrix.flatten()
+    block_id = "_".join([f"{v:.3f}" for v in block_fractions.tolist()])
+    chi_id = "_".join([f"{v:.3f}" for v in chi_matrix.tolist()])
+    id_string = f"f_{block_id}_chi_{chi_id}"
+    fig, ax = plt.subplots()
+    plot_simulation_result(result, fig, ax)
+    block_fraction_string, chi_matrix_string = generate_annotation_str(result)
+    tt = f"Block fractions: {block_fraction_string}\nChi matrix: {chi_matrix_string}"
+    print(tt)
+    trial_number = detect_trial_number(id_string)
+    if result.converged:
+        print(
+            f"Saving visualization to visualizations/vis_{id_string}_{trial_number}.png"
+        )
+        fig.savefig(f"visualizations/vis_{id_string}_{trial_number}.png")
+    else:
+        print("result was not converged, just showing the last frame")
+
     plt.show()

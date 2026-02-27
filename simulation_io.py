@@ -63,6 +63,9 @@ class SimulationData:
     F: np.ndarray = field(default_factory=lambda: np.empty(0))
     box_lengths: np.ndarray = field(default_factory=lambda: np.empty(0))
 
+    # --- output metadata ---
+    converged: bool = False
+
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
@@ -70,9 +73,9 @@ class SimulationData:
     @property
     def n_frames(self) -> int:
         """Number of stored trajectory frames."""
-        if self.F.ndim == 0 or self.F.size == 0:
+        if self.phi.shape[0] == 0:
             return 0
-        return int(self.F.shape[0])
+        return int(self.phi.shape[0])
 
     @property
     def n_components(self) -> int:
@@ -106,6 +109,7 @@ class SimulationData:
             phi=np.empty((0, n, *model.grid_shape), dtype=np.float64),
             F=np.empty((0,), dtype=np.float64),
             box_lengths=np.empty((0, ndim), dtype=np.float64),
+            converged=False,
         )
 
     # ------------------------------------------------------------------
@@ -131,6 +135,9 @@ class SimulationData:
                 box_lengths=np.array(f["box_lengths"], dtype=np.float64)
                 if "box_lengths" in f
                 else np.empty(0),
+                converged=bool(
+                    f.attrs["converged"] if "converged" in f.attrs else False
+                ),
             )
         return data
 
@@ -154,6 +161,7 @@ class SimulationData:
             f.attrs["n_components"] = self.n_components
             f.attrs["phi_bar"] = self.phi_bar
             f.attrs["grid_shape"] = list(self.grid_shape)
+            f.attrs["converged"] = self.converged
 
             # --- matrix / vector datasets ---
             f.create_dataset("block_fractions", data=self.block_fractions)
