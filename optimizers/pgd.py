@@ -1,47 +1,17 @@
-"""
-Joint Optimization of Density Field and Box Dimensions
-=======================================================
-
-Optimizes the RPA free energy functional with respect to both the order
-parameter field delta_phi (via projected gradient descent) and the box
-dimensions L_1, ..., L_d (via standard gradient descent on log L).
-
-Key insight: the constraint set for delta_phi is independent of the box
-dimensions. Both constraints (local incompressibility and mass conservation)
-are purely algebraic on the grid values, so the projection operator is
-the same regardless of the box lengths. The box lengths are unconstrained
-positive parameters that interact with the density only through the
-functional evaluation (via the wavevectors q = 2*pi*n/L and the volume
-prefactors).
-"""
-
 import os
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import pickle
+import numpy as np
 import math
 import torch
 import torch.nn as nn
-from dataclasses import dataclass, field
 from typing import Optional, Callable
 from gen_initial_conditions import (
     generate_initial_hexagonal_ordered_structure,
     generate_hexagonal_A_in_BC_matrix,
 )
 from rpa import BlockCopolymerFreeEnergy
-
-
-@dataclass
-class JointOptimizationResult:
-    """Container for joint optimization results."""
-
-    F_history: list[float] = field(default_factory=list)
-    grad_phi_norm_history: list[float] = field(default_factory=list)
-    grad_box_norm_history: list[float] = field(default_factory=list)
-    L_history: list[list[float]] = field(default_factory=list)
-    converged: bool = False
-    n_outer_iterations: int = 0
-    message: str = ""
+from simulation_io import SimulationData
 
 
 def backtracking_line_search_phi(
@@ -88,17 +58,6 @@ def backtracking_line_search_phi(
         alpha *= beta
 
     return 0.0, delta_phi, current_F
-
-
-def generate_initial_delta_phi(model: nn.Module) -> torch.Tensor:
-    """
-    Generate initial delta_phi for the density field.
-    """
-    phi_init = torch.randn(
-        model.n_components, *model.grid_shape, dtype=model.real_dtype
-    )
-    phi_init = model._project_order_parameter(phi_init)
-    return phi_init
 
 
 def backtracking_line_search_box(
@@ -164,13 +123,13 @@ def optimize_joint(
     n_inner_box: int = 10,
     lr_phi: float = 0.5,
     lr_box: float = 0.1,
-    box_grad_scale: float = 1e4,
+    box_grad_scale: float = 10,
     tol_grad_phi: float = 1e-6,
     tol_grad_box: float = 1e-7,
     use_line_search: bool = True,
     log_every: int = 10,
     callback: Optional[Callable] = None,
-) -> JointOptimizationResult:
+) -> SimulationData:
     """
     Alternating projected gradient descent for density + box optimization.
 
@@ -201,7 +160,11 @@ def optimize_joint(
     if not model.optimize_box:
         raise ValueError("model.optimize_box must be True for joint optimization")
 
-    result = JointOptimizationResult()
+    # Initialize containers for the F, phi, and box_length trajectories to pass into SimulationData object later
+    F_trajectory = []
+    phi_trajectory = []
+    box_lengths_trajectory = []
+    converged = False
 
     for outer in range(n_outer):
         # =================================================================
@@ -282,10 +245,9 @@ def optimize_joint(
         with torch.no_grad():
             F_current = model(delta_phi).item()
 
-        result.F_history.append(F_current)
-        result.grad_phi_norm_history.append(grad_phi_norm)
-        result.grad_box_norm_history.append(grad_box_norm)
-        result.L_history.append(model.L.tolist())
+        F_trajectory.append(F_current)
+        phi_trajectory.append(delta_phi)
+        box_lengths_trajectory.append(model.L.tolist())
 
         if outer % log_every == 0:
             L_str = ", ".join(f"L{d}={v:.6f}" for d, v in enumerate(model.L.tolist()))
@@ -299,27 +261,20 @@ def optimize_joint(
             callback(outer, model, F_current, grad_phi_norm, grad_box_norm)
 
         if grad_phi_norm < tol_grad_phi and grad_box_norm < tol_grad_box:
-            result.converged = True
-            result.n_outer_iterations = outer
-            result.message = (
-                f"Converged at outer iteration {outer}: "
-                f"|grad_phi| = {grad_phi_norm:.4e}, |grad_L| = {grad_box_norm:.4e}"
-            )
-            print(f"\n{result.message}")
-            return result
+            converged = True
+            break
 
-    result.n_outer_iterations = n_outer
-    result.message = (
-        f"Did not converge after {n_outer} outer iterations. "
-        f"|grad_phi| = {grad_phi_norm:.4e}, |grad_L| = {grad_box_norm:.4e}"
-    )
-    print(f"\n{result.message}")
+    if converged:
+        print("Converged at outer iteration", outer)
+        converged = True
+    else:
+        print("Did not converge after", n_outer, "outer iterations")
+    result = SimulationData.from_model(model)
+    result.F = np.array(F_trajectory)
+    result.phi = np.array(phi_trajectory)
+    result.box_lengths = np.array(box_lengths_trajectory)
+    result.converged = converged
     return result
-
-
-# =============================================================================
-# Period scanning utility
-# =============================================================================
 
 
 def scan_box_lengths(
@@ -411,92 +366,3 @@ def scan_box_lengths(
         "L_optimal": L_range[best_idx].item(),
         "F_optimal": F_values[best_idx],
     }
-
-
-if __name__ == "__main__":
-    #  3 component block star copolymer
-    N = 100
-    chi_AB = 20
-    chi_AC = 30
-    chi_BC = 28
-    chi_matrix = (
-        torch.tensor(
-            [
-                [0.0, chi_AB, chi_AC],
-                [chi_AB, 0.0, chi_BC],
-                [chi_AC, chi_BC, 0.0],
-            ],
-            dtype=torch.float64,
-        )
-        * 1
-    )
-    f_A = 0.31
-    f_B = 0.36
-    f_C = 1 - f_A - f_B
-    l_ij_matrix = torch.zeros((3, 3), dtype=torch.float64)
-    # l_ij_matrix[0, 2] = f_B * N * 1.0**2
-    # l_ij_matrix[2, 0] = f_B * N * 1.0**2
-    block_fractions = torch.tensor([f_A, f_B, f_C], dtype=torch.float64)
-
-    Lx = 20.0
-    Ly = Lx * math.sqrt(3)
-
-    grid_res = 32
-
-    delta_phi = generate_hexagonal_A_in_BC_matrix(
-        grid_shape=(grid_res, grid_res),
-        block_fractions=block_fractions,
-        Lx=Lx,
-        Ly=Ly,
-        amplitude=0.2,
-    )
-
-    # Add some noise to the delta_phi
-    delta_phi = delta_phi + torch.randn_like(delta_phi) * 0.01
-
-    model = BlockCopolymerFreeEnergy(
-        N=N,
-        chi_matrix=chi_matrix,
-        l_ij_matrix=l_ij_matrix,
-        block_fractions=block_fractions,
-        optimize_box=True,
-        grid_shape=(grid_res, grid_res),
-        box_lengths=(Lx, Ly),
-        init_amplitude=0.05,
-    )
-
-    model.delta_phi.data.copy_(delta_phi)
-
-    print("initial box lengths:", model.L.tolist())
-    print("initial free energy:", model(model.get_order_parameters()).item())
-
-    result = optimize_joint(
-        model,
-        n_outer=500,
-        lr_box=0.01,
-        lr_phi=0.1,
-        n_inner_phi=500,
-        n_inner_box=5,
-        tol_grad_phi=1e-5,
-        tol_grad_box=1e-6,
-        log_every=50,
-    )
-    print("final box lengths:", model.L.tolist())
-    print("final free energy:", result.F_history[-1])
-    # Save results for visualization with vis.py
-    torch.save(model.get_order_parameters(), "delta_phi.pt")
-    print("saved to delta_phi.pt")
-    torch.save(model, "block_copolymer_model.pt")
-    with open("joint_optimization_result.pkl", "wb") as f:
-        pickle.dump(
-            {
-                "F_history": result.F_history,
-                "grad_phi_norm_history": result.grad_phi_norm_history,
-                "grad_box_norm_history": result.grad_box_norm_history,
-                "L_history": result.L_history,
-                "converged": result.converged,
-                "n_outer_iterations": result.n_outer_iterations,
-                "message": result.message,
-            },
-            f,
-        )
