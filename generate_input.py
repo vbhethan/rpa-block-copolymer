@@ -16,9 +16,9 @@ from vis import plot_simulation_result
 
 # Define polymer parameters
 N = 100
-chi_AB = 30
-chi_AC = 22
-chi_BC = 35
+chi_AB = 28
+chi_AC = 28
+chi_BC = 28
 chi_matrix = (
     torch.tensor(
         [
@@ -30,8 +30,8 @@ chi_matrix = (
     )
     * 1
 )
-f_A = 0.36
-f_B = 0.31
+f_A = 1 / 3
+f_B = 1 / 3
 f_C = 1 - f_A - f_B
 l_ij_matrix = torch.zeros((3, 3), dtype=torch.float64)
 l_ij_matrix[0, 2] = f_B * N * 1.0**2
@@ -50,7 +50,7 @@ model = BlockCopolymerFreeEnergy(
 )
 
 input_data = generate_hexagonal_A_in_BC_matrix(
-    model=model, Lx=Lx, amplitude=0.1, save_filename="input_data.h5", noise_level=0.001
+    model=model, Lx=Lx, amplitude=0.1, save_filename="input_data.h5", noise_level=0.01
 )
 # input_data = generate_random_normal_initial_conditions(
 #     model=model,

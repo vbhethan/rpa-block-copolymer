@@ -81,7 +81,7 @@ def detect_trial_number(id_string: str) -> int:
 
 
 if __name__ == "__main__":
-    result = SimulationData.from_hdf5("output.h5")
+    result = SimulationData.from_hdf5("result.h5")
     print(result.phi.shape)
     block_fractions = result.block_fractions.flatten()
     chi_matrix = result.chi_matrix.flatten()

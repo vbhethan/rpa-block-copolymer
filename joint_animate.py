@@ -45,10 +45,10 @@ def main():
         description="Animate joint dynamics+box-opt trajectory with variable aspect ratio."
     )
     parser.add_argument(
-        "input",
-        nargs="?",
-        default="joint_optimization.h5",
-        help="HDF5 file from joint_phi_box_optimize.py (default: joint_optimization.h5)",
+        "-i",
+        "--input",
+        default="result.h5",
+        help="HDF5 file from joint_phi_box_optimize.py (default: result.h5)",
     )
     parser.add_argument(
         "-o",
@@ -136,9 +136,9 @@ def main():
 
         im.set_data(dom_frames[i])
         im.set_alpha(alpha_frames[i])
-        im.set_extent([0, Lx_i, 0, Ly_i])
-        ax.set_xlim(0, Lx_i)
-        ax.set_ylim(0, Ly_i)
+        im.set_extent([0, Ly_i, 0, Lx_i])
+        ax.set_xlim(0, Ly_i)
+        ax.set_ylim(0, Lx_i)
         title.set_text(_frame_title(i, box_lengths[i], F_values[i]))
         return (im, title)
 
