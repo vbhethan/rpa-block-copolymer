@@ -11,7 +11,7 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 from rpa import BlockCopolymerFreeEnergy
 from simulation_io import SimulationData
-from vis import plot_simulation_result
+from utils.vis import plot_simulation_result
 import math
 import numpy as np
 import matplotlib.pyplot as plt

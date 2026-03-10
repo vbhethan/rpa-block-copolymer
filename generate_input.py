@@ -11,7 +11,7 @@ from initial_conditions import (
     generate_hexagonal_A_in_BC_matrix,
     generate_random_normal_initial_conditions,
 )
-from vis import plot_simulation_result
+from utils.vis import plot_simulation_result
 
 
 # Define polymer parameters

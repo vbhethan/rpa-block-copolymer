@@ -42,9 +42,9 @@ import h5py
 import numpy as np
 import torch
 
-from dynamics import simulate
+from optimizers.dynamics.simulate import simulate
+from optimizers.box_optimize import optimize_box_lengths
 from simulation_io import SimulationData
-from optimize_box import optimize_box_lengths
 from rpa import BlockCopolymerFreeEnergy
 
 
@@ -174,11 +174,11 @@ def joint_optimize(
             dt=dt,
             M=M,
             method=dynamics_method,
+            save_every=n_dynamics_steps,  # only record the final state
             log_every=n_dynamics_steps if log_dynamics else 0,
-            record_every=n_dynamics_steps,  # only record the final state
         )
-        delta_phi = sim_result.final_delta_phi
-        F_dyn = sim_result.F_history[-1]
+        delta_phi = torch.from_numpy(sim_result.phi[-1]).to(torch.float64)
+        F_dyn = float(sim_result.F[-1])
 
         # guard: stop if dynamics produced NaN or negative densities
         f_expanded = model._f_expanded()

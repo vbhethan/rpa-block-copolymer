@@ -22,10 +22,8 @@ import os
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
-import math
 import numpy as np
 import torch
-from dataclasses import dataclass, field
 from rpa import BlockCopolymerFreeEnergy
 from simulation_io import SimulationData
 
@@ -280,8 +278,8 @@ def simulate(
     dt: float = 0.01,
     M: float = 1.0,
     method: str = "semi-implicit",
+    save_every: int = 10,
     log_every: int = 100,
-    record_every: int = 10,
 ) -> SimulationData:
     """
     Run Cahn-Hilliard dynamics simulation.
@@ -289,26 +287,26 @@ def simulate(
     Parameters
     ----------
     model : BlockCopolymerFreeEnergy
-        The RPA model (should have optimize_box=False for dynamics)
+        The RPA model (should have optimize_box=False for dynamics).
     delta_phi : torch.Tensor, optional
         Initial order parameter. If None, uses model's internal field.
     n_steps : int
-        Number of time steps
+        Total number of time steps.
     dt : float
-        Time step size
+        Time step size.
     M : float
-        Mobility coefficient
+        Mobility coefficient.
     method : str
-        "semi-implicit" or "forward-euler"
+        "semi-implicit" or "forward-euler".
+    save_every : int
+        Record a full snapshot every this many steps (frame 0 = initial state).
     log_every : int
-        Print progress every this many steps
-    record_every : int
-        Record diagnostics every this many steps
+        Print progress every this many steps. 0 = silent.
 
     Returns
     -------
-    SimulationResult
-        Trajectory data including free energy history and diagnostics
+    SimulationData
+        Trajectory with phi, F, and box_lengths arrays (n_frames indexed).
     """
     if delta_phi is None:
         delta_phi = model._project_order_parameter(model.delta_phi.data.clone())
@@ -316,197 +314,79 @@ def simulate(
         delta_phi = model._project_order_parameter(delta_phi.clone())
 
     # Pre-compute fixed quantities
-    L = model.L
-    K2 = model._compute_K2(L)
+    K2 = model._compute_K2(model.L)
     if hasattr(model, "_Gamma_ij_cached") and model._Gamma_ij_cached is not None:
         Gamma_ij = model._Gamma_ij_cached
     else:
         Gamma_ij = model._compute_gamma_ij(K2)
 
-    # Select stepping function
     if method == "semi-implicit":
         step_fn = semi_implicit_step
     elif method == "forward-euler":
         step_fn = forward_euler_step
     else:
         raise ValueError(
-            f"Unknown method: {method}. Use 'semi-implicit' or 'forward-euler'."
+            f"Unknown method: {method!r}. Use 'semi-implicit' or 'forward-euler'."
         )
 
-    result = SimulationData()
+    L_np = model.L.detach().cpu().numpy().copy()
+    f_expanded = model._f_expanded()
 
-    # Record initial state
-    with torch.no_grad():
-        F0 = model(delta_phi, Gamma_ij=Gamma_ij).item()
-    F_history = [F0]
-    phi_history = [delta_phi.detach().clone()]
+    t_frames: list[float] = []
+    F_frames: list[float] = []
+    phi_frames: list[np.ndarray] = []
+    box_lengths_frames: list[np.ndarray] = []
 
-    if log_every > 0:
-        print(f"Step {0:6d} | t = {0.0:.4e} | F = {F0:.8e}")
+    def _record(step: int, phi: torch.Tensor) -> None:
+        t = step * dt
+        with torch.no_grad():
+            F = model(phi, Gamma_ij=Gamma_ij).item()
+        t_frames.append(t)
+        F_frames.append(F)
+        phi_frames.append(phi.detach().cpu().numpy().copy())
+        box_lengths_frames.append(L_np.copy())
 
+        if log_every > 0 and (step == 0 or step % log_every == 0):
+            cons_err = phi.mean(dim=model.spatial_dims).abs().max().item()
+            incomp_err = phi.sum(dim=0).abs().max().item()
+            print(
+                f"  step {step:7d} | t = {t:.4e} | F = {F:.8e} | "
+                f"cons = {cons_err:.2e} | incomp = {incomp_err:.2e}"
+            )
+
+    _record(0, delta_phi)
+
+    n_steps_completed = 0
     for step in range(1, n_steps + 1):
         delta_phi = step_fn(delta_phi, model, dt, M, Gamma_ij, K2)
+        n_steps_completed = step
 
-        if step % record_every == 0 or step == n_steps:
+        if step % save_every == 0 or step == n_steps:
+            _record(step, delta_phi)
+        elif log_every > 0 and step % log_every == 0:
             t = step * dt
-            with torch.no_grad():
-                F = model(delta_phi, Gamma_ij=Gamma_ij).item()
-
-            cons_err = delta_phi.mean(dim=model.spatial_dims).abs().max().item()
-            incomp_err = delta_phi.sum(dim=0).abs().max().item()
-
-            result.F_history.append(F)
-            result.t_history.append(t)
-            result.conservation_error.append(cons_err)
-            result.incompressibility_error.append(incomp_err)
-
-        if log_every > 0 and step % log_every == 0:
-            t = step * dt
-            # Use latest recorded F
-            F_latest = result.F_history[-1]
-            cons_err = result.conservation_error[-1]
-            incomp_err = result.incompressibility_error[-1]
             print(
-                f"Step {step:6d} | t = {t:.4e} | F = {F_latest:.8e} | "
-                f"cons_err = {cons_err:.2e} | incomp_err = {incomp_err:.2e}"
+                f"  step {step:7d} | t = {t:.4e} | F = {F_frames[-1]:.8e} (last saved frame)"
             )
-            F_history.append(F)
-            phi_history.append(delta_phi.detach().clone())
 
-        # Safety check: if density goes negative, warn and stop
-        f_expanded = model._f_expanded()
-        rho = delta_phi + f_expanded * model.phi_bar
-        if rho.min().item() < 0:
+        rho_min = (delta_phi + f_expanded * model.phi_bar).min().item()
+        if rho_min < 0:
             print(
-                f"WARNING: Negative density at step {step} (min rho = {rho.min().item():.4e}). "
-                f"Consider reducing dt."
+                f"\nWARNING: negative density at step {step} "
+                f"(min rho = {rho_min:.4e}). Aborting — reduce dt."
             )
             break
 
     result = SimulationData.from_model(model)
-    result.F = np.array(F_history, dtype=np.float64)
-    result.phi = np.array(phi_history, dtype=np.float64)
+    result.phi = np.stack(phi_frames, axis=0)
+    result.F = np.array(F_frames, dtype=np.float64)
+    result.box_lengths = np.stack(box_lengths_frames, axis=0)
 
     if log_every > 0:
-        print(f"\nSimulation complete: {result.n_steps_completed} steps")
-        print(f"  F_initial = {result.F_history[0]:.8e}")
-        print(f"  F_final   = {result.F_history[-1]:.8e}")
-        print(f"  ΔF        = {result.F_history[-1] - result.F_history[0]:.8e}")
+        print(f"\nSimulation complete: {n_steps_completed} steps")
+        print(f"  F_initial = {result.F[0]:.8e}")
+        print(f"  F_final   = {result.F[-1]:.8e}")
+        print(f"  ΔF        = {result.F[-1] - result.F[0]:.8e}")
 
     return result
 
-
-if __name__ == "__main__":
-    torch.manual_seed(42)
-
-    # === System setup: 3-component symmetric star copolymer ===
-    N = 100
-    chiN = 26
-    chi_matrix = torch.ones((3, 3), dtype=torch.float64) * chiN
-    chi_matrix.fill_diagonal_(0.0)
-    block_fractions = torch.tensor([1 / 3, 1 / 3, 1 / 3], dtype=torch.float64)
-    l_ij_matrix = torch.zeros((3, 3), dtype=torch.float64)
-
-    Lx, Ly = 10.0, 10.0
-    grid_res = 32
-
-    model = BlockCopolymerFreeEnergy(
-        N=N,
-        chi_matrix=chi_matrix,
-        l_ij_matrix=l_ij_matrix,
-        block_fractions=block_fractions,
-        optimize_box=False,
-        grid_shape=(grid_res, grid_res),
-        box_lengths=(Lx, Ly),
-        init_amplitude=0.05,
-    )
-
-    print("=" * 60)
-    print("Cahn-Hilliard Dynamics: 3-component star copolymer")
-    print("=" * 60)
-    print(f"Grid: {grid_res}x{grid_res}, Box: {Lx}x{Ly}")
-    print(f"chiN = {chiN}, N = {N}")
-    print()
-
-    # === Run semi-implicit simulation ===
-    print("--- Semi-implicit method ---")
-    delta_phi_init = model._project_order_parameter(model.delta_phi.data.clone())
-    result_si = simulate(
-        model,
-        delta_phi=delta_phi_init,
-        n_steps=2000,
-        dt=0.01,
-        M=1.0,
-        method="semi-implicit",
-        log_every=500,
-        record_every=10,
-    )
-
-    # === Verify monotonic energy decrease ===
-    F_arr = torch.tensor(result_si.F_history)
-    dF = F_arr[1:] - F_arr[:-1]
-    n_increasing = (dF > 1e-12).sum().item()
-    print(f"\nMonotonicity check: {n_increasing} steps with ΔF > 0 out of {len(dF)}")
-    if n_increasing == 0:
-        print("  PASS: Free energy is monotonically decreasing")
-    else:
-        max_increase = dF[dF > 0].max().item() if n_increasing > 0 else 0
-        print(f"  WARNING: Max increase = {max_increase:.4e}")
-
-    # === Verify conservation ===
-    max_cons = max(result_si.conservation_error)
-    max_incomp = max(result_si.incompressibility_error)
-    print(f"\nConservation check: max zero-mean error = {max_cons:.4e}")
-    print(f"Incompressibility check: max error = {max_incomp:.4e}")
-
-    # === Compare forward Euler and semi-implicit at small dt ===
-    # Forward Euler stability for Cahn-Hilliard requires dt * M * q_max^2 * ||Gamma|| < ~2.
-    # With q_max^2 ~ 1000 and ||Gamma|| ~ 900, we need dt ~ 1e-6.
-    small_dt = 1e-6
-    n_compare = 100
-    print(
-        f"\n--- Forward Euler vs Semi-implicit (dt={small_dt}, {n_compare} steps) ---"
-    )
-    delta_phi_init2 = model._project_order_parameter(model.delta_phi.data.clone())
-    result_fe = simulate(
-        model,
-        delta_phi=delta_phi_init2.clone(),
-        n_steps=n_compare,
-        dt=small_dt,
-        M=1.0,
-        method="forward-euler",
-        log_every=0,
-        record_every=n_compare,
-    )
-
-    result_si_small = simulate(
-        model,
-        delta_phi=delta_phi_init2.clone(),
-        n_steps=n_compare,
-        dt=small_dt,
-        M=1.0,
-        method="semi-implicit",
-        log_every=0,
-        record_every=n_compare,
-    )
-
-    print(f"  Forward Euler F = {result_fe.F_history[-1]:.10e}")
-    print(f"  Semi-implicit F = {result_si_small.F_history[-1]:.10e}")
-    print(
-        f"  ΔF difference   = {abs(result_fe.F_history[-1] - result_si_small.F_history[-1]):.4e}"
-    )
-
-    diff_norm = (
-        (result_fe.final_delta_phi - result_si_small.final_delta_phi).norm().item()
-    )
-    field_norm = result_fe.final_delta_phi.norm().item()
-    rel_diff = diff_norm / max(field_norm, 1e-15)
-    print(f"  Field difference (L2 relative) = {rel_diff:.4e}")
-    if rel_diff < 0.01:
-        print("  PASS: Schemes agree at small dt")
-    else:
-        print(f"  WARNING: Relative field difference = {rel_diff:.4e}")
-
-    print("\n" + "=" * 60)
-    print("All checks complete.")
-    print("=" * 60)

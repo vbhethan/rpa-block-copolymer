@@ -18,7 +18,7 @@ Output HDF5 schema (from SimulationData.to_hdf5):
   block_fractions, chi_matrix, l_ij_matrix, plus scalar attrs
 
 Additional run-specific attrs written after:
-  dt, M, method, n_steps, n_steps_completed, save_every
+  dt, M, method, n_steps, save_every
 
 Usage
 -----
@@ -37,122 +37,8 @@ import h5py
 import numpy as np
 import torch
 
-from rpa import BlockCopolymerFreeEnergy
 from simulation_io import SimulationData
-from optimizers.dynamics.simulate import forward_euler_step, semi_implicit_step
-
-
-# ---------------------------------------------------------------------------
-# Core simulation loop
-# ---------------------------------------------------------------------------
-
-
-def _run(
-    model: BlockCopolymerFreeEnergy,
-    delta_phi: torch.Tensor,
-    n_steps: int,
-    dt: float,
-    M: float,
-    method: str,
-    save_every: int,
-    log_every: int,
-) -> dict:
-    """
-    Integrate the Cahn-Hilliard equation and collect trajectory snapshots.
-
-    Parameters
-    ----------
-    model : BlockCopolymerFreeEnergy
-        Must have ``optimize_box=False`` so Gamma_ij is pre-cached.
-    delta_phi : torch.Tensor
-        Initial order-parameter field, shape (n_components, *grid_shape).
-    n_steps : int
-        Total number of time steps.
-    dt : float
-        Time step size.
-    M : float
-        Mobility coefficient.
-    method : str
-        ``"semi-implicit"`` or ``"forward-euler"``.
-    save_every : int
-        Record a full snapshot every this many steps (frame 0 = initial state).
-    log_every : int
-        Print a one-line summary every this many steps (0 = silent).
-
-    Returns
-    -------
-    dict with numpy arrays: t_frames, F_frames, phi_frames, box_lengths_frames,
-    and n_steps_completed (int).
-    """
-    delta_phi = model._project_order_parameter(delta_phi.clone())
-
-    K2 = model._compute_K2(model.L)
-    if hasattr(model, "_Gamma_ij_cached") and model._Gamma_ij_cached is not None:
-        Gamma_ij = model._Gamma_ij_cached
-    else:
-        Gamma_ij = model._compute_gamma_ij(K2)
-
-    step_fn = {
-        "semi-implicit": semi_implicit_step,
-        "forward-euler": forward_euler_step,
-    }[method]
-
-    L_np = model.L.detach().cpu().numpy().copy()
-
-    t_frames: list[float] = []
-    F_frames: list[float] = []
-    phi_frames: list[np.ndarray] = []
-    box_lengths_frames: list[np.ndarray] = []
-
-    def _record(step: int, phi: torch.Tensor) -> None:
-        t = step * dt
-        with torch.no_grad():
-            F = model(phi, Gamma_ij=Gamma_ij).item()
-        t_frames.append(t)
-        F_frames.append(F)
-        phi_frames.append(phi.detach().cpu().numpy().copy())
-        box_lengths_frames.append(L_np.copy())
-
-        if log_every > 0 and (step == 0 or step % log_every == 0):
-            cons_err = phi.mean(dim=model.spatial_dims).abs().max().item()
-            incomp_err = phi.sum(dim=0).abs().max().item()
-            print(
-                f"  step {step:7d} | t = {t:.4e} | F = {F:.8e} | "
-                f"cons = {cons_err:.2e} | incomp = {incomp_err:.2e}"
-            )
-
-    _record(0, delta_phi)
-
-    n_steps_completed = 0
-    f_expanded = model._f_expanded()
-
-    for step in range(1, n_steps + 1):
-        delta_phi = step_fn(delta_phi, model, dt, M, Gamma_ij, K2)
-        n_steps_completed = step
-
-        if step % save_every == 0 or step == n_steps:
-            _record(step, delta_phi)
-        elif log_every > 0 and step % log_every == 0:
-            t = step * dt
-            print(
-                f"  step {step:7d} | t = {t:.4e} | F = {F_frames[-1]:.8e} (last saved frame)"
-            )
-
-        rho_min = (delta_phi + f_expanded * model.phi_bar).min().item()
-        if rho_min < 0:
-            print(
-                f"\nWARNING: negative density at step {step} "
-                f"(min rho = {rho_min:.4e}). Aborting — reduce dt."
-            )
-            break
-
-    return {
-        "t_frames": np.array(t_frames, dtype=np.float64),
-        "F_frames": np.array(F_frames, dtype=np.float64),
-        "phi_frames": np.stack(phi_frames, axis=0),
-        "box_lengths_frames": np.stack(box_lengths_frames, axis=0),
-        "n_steps_completed": n_steps_completed,
-    }
+from optimizers.dynamics.simulate import simulate
 
 
 # ---------------------------------------------------------------------------
@@ -226,22 +112,21 @@ def main():
     if sim_data.n_frames > 0:
         phi_init_np, _ = sim_data.final_state()
         delta_phi = torch.from_numpy(phi_init_np).to(torch.float64)
-        print(f"  Initial conditions: last frame of input trajectory")
+        print("  Initial conditions: last frame of input trajectory")
     else:
         delta_phi = model.delta_phi.data.clone()
-        print(f"  Initial conditions: model default (random)")
+        print("  Initial conditions: model default (random)")
 
     print(f"  Grid       : {model.grid_shape}")
     print(f"  Box        : {[f'{v:.4f}' for v in model.L.tolist()]}")
     print(f"  n_comp     : {model.n_components}")
     print(f"  Method     : {args.method},  dt = {args.dt}")
     print(f"  Steps      : {args.n_steps}  (save every {args.save_every})")
-    n_frames = args.n_steps // args.save_every + 1
-    print(f"  Frames     : ~{n_frames}")
+    print(f"  Frames     : ~{args.n_steps // args.save_every + 1}")
     print()
 
     # --- Run ---
-    result = _run(
+    result = simulate(
         model=model,
         delta_phi=delta_phi,
         n_steps=args.n_steps,
@@ -254,27 +139,23 @@ def main():
 
     # --- Save ---
     print(f"\nSaving to {args.output} ...")
-    out = SimulationData.from_model(model)
-    out.phi = result["phi_frames"]
-    out.F = result["F_frames"]
-    out.box_lengths = result["box_lengths_frames"]
-    out.to_hdf5(args.output)
+    result.to_hdf5(args.output)
 
+    # Write run-specific provenance attrs and time axis
+    t = np.arange(result.n_frames) * args.save_every * args.dt
     with h5py.File(args.output, "a") as f:
         f.attrs["dt"] = args.dt
         f.attrs["M"] = args.M
         f.attrs["method"] = args.method
         f.attrs["n_steps"] = args.n_steps
-        f.attrs["n_steps_completed"] = result["n_steps_completed"]
         f.attrs["save_every"] = args.save_every
-        f.create_dataset("t", data=result["t_frames"])
+        f.create_dataset("t", data=t)
 
-    phi_shape = result["phi_frames"].shape
-    print(f"  phi shape  : {phi_shape}  (n_frames x n_comp x grid...)")
-    print(f"  F_initial  = {result['F_frames'][0]:.8e}")
-    print(f"  F_final    = {result['F_frames'][-1]:.8e}")
-    print(f"  delta_F    = {result['F_frames'][-1] - result['F_frames'][0]:.8e}")
-    print(f"  Frames     : {phi_shape[0]}")
+    print(f"  phi shape  : {result.phi.shape}  (n_frames x n_comp x grid...)")
+    print(f"  F_initial  = {result.F[0]:.8e}")
+    print(f"  F_final    = {result.F[-1]:.8e}")
+    print(f"  delta_F    = {result.F[-1] - result.F[0]:.8e}")
+    print(f"  Frames     : {result.n_frames}")
     print(f"\nDone. Written to: {args.output}")
 
 
