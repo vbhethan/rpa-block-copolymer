@@ -19,6 +19,7 @@ __pycache__/
 # datafiles
 *.pt 
 *.h5 
+*.rf
 
 
 # Other
