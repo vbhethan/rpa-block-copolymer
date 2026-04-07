@@ -11,7 +11,8 @@ pytorch = { version = ">=2.0", channel = "pytorch" }
 numpy = ">=1.24"
 h5py = ">=3.8"
 matplotlib = ">=3.7"
+pytest = ">=7.0"
 
 [tasks]
-test = "python tests.py"
+test = "pytest tests/ -v"
 gen-input = "python generate_input.py"

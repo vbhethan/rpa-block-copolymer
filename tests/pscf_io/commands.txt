@@ -1,0 +1,5 @@
+READ_C_RGRID       in/c.rf
+ESTIMATE_W_FROM_C
+ITERATE
+WRITE_C_RGRID      out/c.rf
+FINISH
