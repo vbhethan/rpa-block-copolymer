@@ -53,13 +53,13 @@ if __name__ == "__main__":
         "-n",
         "--n_outer",
         type=int,
-        default=500,
+        default=250,
         help="Number of outer iterations",
     )
     p.add_argument(
         "--lr_box",
         type=float,
-        default=0.01,
+        default=1.0,
         help="Learning rate for box lengths",
     )
     p.add_argument(
@@ -71,26 +71,33 @@ if __name__ == "__main__":
     p.add_argument(
         "--n_inner_phi",
         type=int,
-        default=1000,
+        default=2000,
         help="Number of inner iterations for density field",
     )
     p.add_argument(
         "--n_inner_box",
         type=int,
-        default=5,
+        default=10,
         help="Number of inner iterations for box lengths",
     )
     p.add_argument(
         "--tol_grad_phi",
         type=float,
-        default=1e-5,
-        help="Tolerance for gradient of density field",
+        default=None,
+        help="Tolerance for gradient of density field (default: 1e-6 for float64, 1e-5 for float32)",
     )
     p.add_argument(
         "--tol_grad_box",
         type=float,
-        default=1e-6,
-        help="Tolerance for gradient of box lengths",
+        default=None,
+        help="Tolerance for gradient of box lengths (default: 1e-6 for float64, 1e-5 for float32)",
+    )
+    p.add_argument(
+        "--dtype",
+        type=str,
+        default="float64",
+        choices=["float32", "float64"],
+        help="Floating-point precision (float32 is faster but less accurate)",
     )
     p.add_argument(
         "--log_every",
@@ -98,11 +105,11 @@ if __name__ == "__main__":
         default=50,
         help="Number of outer iterations between logging",
     )
-    p.add_argument(
-        "--use_line_search",
-        action="store_true",
-        help="Use line search for density field update",
-    )
+    # p.add_argument(
+    #     "--use_line_search",
+    #     action="store_true",
+    #     help="Use line search for density field update",
+    # )
     p.add_argument(
         "--box_grad_scale",
         type=float,
@@ -112,9 +119,21 @@ if __name__ == "__main__":
 
     args = p.parse_args()
 
+    dtype = torch.float32 if args.dtype == "float32" else torch.float64
+    tol_grad_phi = (
+        args.tol_grad_phi
+        if args.tol_grad_phi is not None
+        else (1e-5 if dtype == torch.float32 else 1e-6)
+    )
+    tol_grad_box = (
+        args.tol_grad_box
+        if args.tol_grad_box is not None
+        else (1e-5 if dtype == torch.float32 else 1e-6)
+    )
+
     simulation_data = SimulationData.from_hdf5(args.input_file)
 
-    model = simulation_data.build_model(optimize_box=True)
+    model = simulation_data.build_model(optimize_box=True, dtype=dtype)
 
     print("initial box lengths:", model.L.tolist())
     print("initial free energy:", model(model.get_order_parameters()).item())
@@ -126,10 +145,10 @@ if __name__ == "__main__":
         lr_phi=args.lr_phi,
         n_inner_phi=args.n_inner_phi,
         n_inner_box=args.n_inner_box,
-        tol_grad_phi=args.tol_grad_phi,
-        tol_grad_box=args.tol_grad_box,
+        tol_grad_phi=tol_grad_phi,
+        tol_grad_box=tol_grad_box,
         log_every=args.log_every,
-        use_line_search=args.use_line_search,
+        use_line_search=True,
         box_grad_scale=args.box_grad_scale,
     )
 

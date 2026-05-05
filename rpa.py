@@ -16,6 +16,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torch.nn as nn
 
+_REAL_TO_COMPLEX = {torch.float32: torch.complex64, torch.float64: torch.complex128}
+
 
 class BlockCopolymerFreeEnergy(nn.Module):
     """
@@ -71,10 +73,13 @@ class BlockCopolymerFreeEnergy(nn.Module):
         box_lengths: tuple[float, ...] | None = None,
         init_amplitude: float = 0.01,
         optimize_box: bool = False,
+        dtype: torch.dtype = torch.float64,
     ):
         super().__init__()
-        self.real_dtype = torch.float64
-        self.complex_dtype = torch.complex128
+        if dtype not in _REAL_TO_COMPLEX:
+            raise ValueError(f"dtype must be torch.float32 or torch.float64, got {dtype}")
+        self.real_dtype = dtype
+        self.complex_dtype = _REAL_TO_COMPLEX[dtype]
 
         # Validate inputs
         if block_fractions is None:
@@ -282,7 +287,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         # Numerically stable small-x forms:
         # u(x) = (1 - exp(-x)) / x, u(0) = 1
         # v(x) = 2 * (exp(-x) - 1 + x) / x^2, v(0) = 1
-        eps = 1e-8
+        eps = 1e-4 if self.real_dtype == torch.float32 else 1e-8
         xi_safe = torch.where(xi > eps, xi, torch.ones_like(xi))
         u = torch.where(
             xi > eps,
@@ -392,6 +397,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         self,
         delta_phi: torch.Tensor | None = None,
         Gamma_ij: torch.Tensor | None = None,
+        project: bool = True,
     ) -> torch.Tensor:
         """
         Compute the total free energy of the system.
@@ -404,14 +410,19 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Gamma_ij : torch.Tensor, optional
             Pre-computed vertex function. If provided, skips recomputation.
             Useful when the box dimensions are held fixed across many calls.
+        project : bool
+            If False, skip projection (caller guarantees field is already on
+            the constraint manifold). Avoids redundant work in tight loops.
 
         Returns
         -------
         F_total : torch.Tensor
             Scalar tensor containing the total free energy
         """
-        # Get order parameters (projected to satisfy physical constraints)
-        delta_phi = self._get_order_parameter(delta_phi)
+        if project:
+            delta_phi = self._get_order_parameter(delta_phi)
+        elif delta_phi is None:
+            delta_phi = self.delta_phi
 
         # Get current Gamma_ij
         if Gamma_ij is None:
