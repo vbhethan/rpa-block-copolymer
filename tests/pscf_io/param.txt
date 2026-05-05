@@ -1,0 +1,36 @@
+System{
+  Mixture{
+    nMonomer  2
+    monomers[
+      1.0000000000e+00
+      1.0000000000e+00
+    ]
+    nPolymer  1
+    Polymer{
+      nBlock   2
+      nVertex  3
+      blocks[
+        0  0  1  5.0000000000e-01
+        1  1  2  5.0000000000e-01
+      ]
+      phi  1.0000000000e+00
+    }
+  }
+  ChiInteraction{
+    chi(
+      0  0  0.0000000000e+00
+      0  1  1.1000000000e-01
+      1  1  0.0000000000e+00
+    )
+  }
+  Domain{
+    mesh        32     4     4
+    lattice    orthorhombic
+  }
+  AmIterator{
+    maxItr      200
+    epsilon     1.00e-08
+    maxHist     50
+    isFlexible  0
+  }
+}
