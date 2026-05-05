@@ -23,10 +23,7 @@ import math
 import torch
 import torch.nn as nn
 from typing import Optional, Callable
-from gen_initial_conditions import (
-    generate_initial_hexagonal_ordered_structure,
-    generate_hexagonal_A_in_BC_matrix,
-)
+
 import argparse
 from rpa import BlockCopolymerFreeEnergy
 from simulation_io import SimulationData
