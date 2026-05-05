@@ -20,7 +20,7 @@ import h5py
 import numpy as np
 import torch
 
-from rpa import BlockCopolymerFreeEnergy
+from .free_energy import BlockCopolymerFreeEnergy
 
 
 @dataclass

@@ -1,12 +1,5 @@
-import os
-import sys
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-# Allow running this file directly: python tests/test_rpa.py
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
-
 import torch
+
 from rpa import BlockCopolymerFreeEnergy
 
 

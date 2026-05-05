@@ -24,10 +24,11 @@ import os
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import math
+
 import numpy as np
 import torch
-from rpa import BlockCopolymerFreeEnergy
-from simulation_io import SimulationData
+
+from rpa import BlockCopolymerFreeEnergy, SimulationData
 
 # ---------------------------------------------------------------------------
 # Parameters  (f_A=0.35, chi*N=35 → well inside HEX)

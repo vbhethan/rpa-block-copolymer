@@ -18,16 +18,13 @@ prefactors).
 import os
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import numpy as np
-import math
-import torch
-import torch.nn as nn
-from typing import Optional, Callable
 
 import argparse
-from rpa import BlockCopolymerFreeEnergy
-from simulation_io import SimulationData
-from optimizers.pgd import optimize_joint
+
+import torch
+
+from rpa import SimulationData
+from rpa.optimizers import optimize_joint
 
 
 if __name__ == "__main__":

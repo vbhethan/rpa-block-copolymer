@@ -4,17 +4,13 @@ Methods that generate initial conditions for block copolymer systems as starting
 Use the simulation_io.SimulationData class to write initial conditions to an HDF5 file which can be used to initialize a model and simulation
 """
 
-import os
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-import torch
-from rpa import BlockCopolymerFreeEnergy
-from simulation_io import SimulationData
-from vis import plot_simulation_result
 import math
+
 import numpy as np
-import matplotlib.pyplot as plt
+import torch
+
+from .free_energy import BlockCopolymerFreeEnergy
+from .simulation_io import SimulationData
 
 
 def generate_random_normal_initial_conditions(
@@ -267,34 +263,3 @@ FCC_111_200_STAR = [
 LAMELLAR_Z = [(0, 0, 1)]
 
 
-if __name__ == "__main__":
-    N = 100
-    f_A = 1 / 3
-    f_B = 1 / 3
-    f_C = 1 - f_A - f_B
-    grid_shape = (32, 32)
-    Lx = 20.0
-    Ly = Lx * math.sqrt(3)
-    box_lengths = (Lx, Ly)
-    model = BlockCopolymerFreeEnergy(
-        N=N,
-        chi_matrix=torch.tensor(
-            [[0.0, 26.0, 26.0], [26.0, 0.0, 26.0], [26.0, 26.0, 0.0]]
-        ),
-        l_ij_matrix=torch.tensor(
-            [
-                [0.0, 0.0, f_B * N * 1.0**2],
-                [0.0, 0.0, 0.0],
-                [f_B * N * 1.0**2, 0.0, 0.0],
-            ]
-        ),
-        block_fractions=torch.tensor([f_A, f_B, f_C]),
-        grid_shape=(32, 32),
-        box_lengths=box_lengths,
-    )
-    simulation_data = generate_hexagonal_A_in_BC_matrix(model)
-    print(simulation_data.phi.shape)
-    print(simulation_data.box_lengths)
-    fig, ax = plt.subplots()
-    plot_simulation_result(simulation_data, fig, ax)
-    plt.show()

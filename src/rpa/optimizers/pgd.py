@@ -1,15 +1,12 @@
-import os
+from typing import Callable, Optional
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
-import math
 import torch
 import torch.nn as nn
-from typing import Optional, Callable
-
-from rpa import BlockCopolymerFreeEnergy
-from simulation_io import SimulationData
 from tqdm import tqdm
+
+from ..free_energy import BlockCopolymerFreeEnergy
+from ..simulation_io import SimulationData
 
 
 def _model_real_dtype(model) -> torch.dtype:

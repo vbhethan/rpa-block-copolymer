@@ -1,16 +1,14 @@
 import os
 
 os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import torch
-import numpy as np
-import math
-import matplotlib.pyplot as plt
-from simulation_io import SimulationData
-from rpa import BlockCopolymerFreeEnergy
-from initial_conditions import generate_fourier_mode_initial_conditions
-from initial_conditions import BCC_110_STAR as INITIAL_CONDITION
 
-from vis import plot_simulation_result
+import torch
+
+from rpa import BlockCopolymerFreeEnergy
+from rpa.initial_conditions import (
+    BCC_110_STAR as INITIAL_CONDITION,
+    generate_fourier_mode_initial_conditions,
+)
 
 
 DTYPE = torch.float64  # change to torch.float32 to test single precision

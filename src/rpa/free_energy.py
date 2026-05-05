@@ -7,11 +7,7 @@ Supports arbitrary chain architectures through distance matrices.
 Supports 1D, 2D, and 3D spatial grids.
 """
 
-# Fix OpenMP conflict on macOS (must be before importing torch/numpy)
 import math
-import os
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import torch
 import torch.nn as nn

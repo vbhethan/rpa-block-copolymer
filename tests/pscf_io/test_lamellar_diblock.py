@@ -6,20 +6,18 @@ Morphology: lamellar, density varies along x only.
 Output:  param.txt, c.rf, commands.txt written to this directory.
 """
 
-import os
-import sys
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
-# Allow imports from the repo root regardless of working directory
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
-
 import math
+import os
+
 import numpy as np
 import torch
-from rpa import BlockCopolymerFreeEnergy
-from simulation_io import SimulationData
-from pscf_io import write_param_file, write_C_RGRID_from_array, write_command_file
+
+from rpa import BlockCopolymerFreeEnergy, SimulationData
+from rpa.pscf_io import (
+    write_C_RGRID_from_array,
+    write_command_file,
+    write_param_file,
+)
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 

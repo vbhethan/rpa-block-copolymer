@@ -5,7 +5,7 @@ A set of functions to read and write pscf input and output files from data gener
 
 import numpy as np
 
-from simulation_io import SimulationData
+from .simulation_io import SimulationData
 
 _CRYSTAL_SYSTEMS = {1: "lamellar", 2: "rectangular", 3: "orthorhombic"}
 
