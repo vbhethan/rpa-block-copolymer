@@ -1,7 +1,5 @@
-export PYTHON_EXE="/Users/vbhethan/miniconda3/envs/torch/bin/python"
-
 # float64 run (reference)
-# $PYTHON_EXE scripts/optimize_density.py -i input_data.h5 -o result.h5 \
+# pixi run python scripts/optimize_density.py -i input_data.h5 -o result.h5 \
 #     -n 250 \
 #     --lr_box 1.0 --lr_phi 0.1 \
 #     --n_inner_phi 2000 --n_inner_box 10 \
@@ -10,7 +8,7 @@ export PYTHON_EXE="/Users/vbhethan/miniconda3/envs/torch/bin/python"
 #     > optimizer.log 2>&1
 
 # float32 run (precision test)
-$PYTHON_EXE scripts/optimize_density.py -i input_bcc.h5 -o ./local/tabulated_run_results/bcc/result_bcc.h5 \
+pixi run python scripts/optimize_density.py -i input_bcc.h5 -o ./result_bcc.h5 \
     --dtype float32 \
     -n 50 \
     --lr_box 1.0 --lr_phi 1.0 \
