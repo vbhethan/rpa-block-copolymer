@@ -110,6 +110,12 @@ if __name__ == "__main__":
         default=10,
         help="Scale for box-length gradient",
     )
+    p.add_argument(
+        "--device",
+        type=str,
+        default="cpu",
+        help="Torch device to use, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu)",
+    )
 
     args = p.parse_args()
 
@@ -127,7 +133,7 @@ if __name__ == "__main__":
 
     simulation_data = SimulationData.from_hdf5(args.input_file)
 
-    model = simulation_data.build_model(optimize_box=True, dtype=dtype)
+    model = simulation_data.build_model(optimize_box=True, dtype=dtype, device=args.device)
 
     print("initial box lengths:", model.L.tolist())
     print("initial free energy:", model(model.get_order_parameters()).item())

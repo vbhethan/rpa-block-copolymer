@@ -70,6 +70,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
         init_amplitude: float = 0.01,
         optimize_box: bool = False,
         dtype: torch.dtype = torch.float64,
+        device: torch.device | str = "cpu",
     ):
         super().__init__()
         if dtype not in _REAL_TO_COMPLEX:
@@ -192,6 +193,8 @@ class BlockCopolymerFreeEnergy(nn.Module):
         )
         delta_phi_init = delta_phi_init - delta_phi_init.mean(dim=0, keepdim=True)
         self.delta_phi = nn.Parameter(delta_phi_init)
+
+        self.to(device)
 
     # ------------------------------------------------------------------
     # Properties

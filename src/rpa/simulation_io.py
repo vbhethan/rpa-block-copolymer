@@ -189,6 +189,7 @@ class SimulationData:
         optimize_box: bool = False,
         frame: int = -1,
         dtype: torch.dtype = torch.float64,
+        device: torch.device | str = "cpu",
     ) -> BlockCopolymerFreeEnergy:
         """
         Reconstruct a BlockCopolymerFreeEnergy from stored system parameters.
@@ -230,10 +231,11 @@ class SimulationData:
             box_lengths=box_lengths,
             optimize_box=optimize_box,
             dtype=dtype,
+            device=device,
         )
 
         if has_trajectory:
-            phi_tensor = torch.from_numpy(self.phi[frame].copy()).to(dtype)
+            phi_tensor = torch.from_numpy(self.phi[frame].copy()).to(dtype).to(device)
             model.delta_phi = torch.nn.Parameter(phi_tensor)
 
         return model
