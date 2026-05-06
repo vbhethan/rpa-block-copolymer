@@ -249,7 +249,7 @@ def optimize_joint(
         # Logging and convergence check
         # =================================================================
         F_trajectory.append(current_F)
-        phi_trajectory.append(delta_phi)
+        phi_trajectory.append(delta_phi.detach().cpu().numpy())
         box_lengths_trajectory.append(model.L.tolist())
 
         if outer % log_every == 0:
