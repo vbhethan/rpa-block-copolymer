@@ -12,7 +12,7 @@ dependencies = [
     "numpy>=1.24",
     "h5py>=3.8",
     "matplotlib>=3.7",
-    "scikit-image>=0.26,<0.27",
+    "scikit-image>=0.19",
     "tqdm",
 ]
 
@@ -26,10 +26,10 @@ packages = ["src/rpa"]
 testpaths = ["tests"]
 
 # --- pixi  --- #
-[tool.pixi.project]
+[tool.pixi.workspace]
 name = "rpa-pscf-io"
 channels = ["pytorch", "conda-forge"]
-platforms = ["osx-arm64"]
+platforms = ["osx-arm64", "linux-64"]
 
 [tool.pixi.dependencies]
 python = ">=3.11,<3.14"
@@ -37,12 +37,12 @@ pytorch = { version = ">=2.0", channel = "pytorch" }
 numpy = ">=1.24"
 h5py = ">=3.8"
 matplotlib = ">=3.7"
-scikit-image = ">=0.26.0,<0.27"
 tqdm = ">=4.65"
 pytest = ">=7.0"
 
 [tool.pixi.pypi-dependencies]
 rpa = { path = ".", editable = true }
+scikit-image = ">=0.19"
 
 [tool.pixi.tasks]
 test = "pytest tests/ -v"
