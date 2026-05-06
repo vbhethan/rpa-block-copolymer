@@ -1433,7 +1433,7 @@ packages:
 - pypi: ./
   name: rpa
   version: 0.1.0
-  sha256: d048c308e3eb27bc3e4c1faa14d64d4d8b0bf73b5f8ad86b4c5e16ae238a0782
+  sha256: b1568cf91cdf10ea36af3d5104b67b2c0640371b8a05d185f5d14d260c387638
   requires_dist:
   - torch>=2.0
   - numpy>=1.24
@@ -1441,6 +1441,7 @@ packages:
   - matplotlib>=3.7
   - scikit-image>=0.26,<0.27
   - tqdm
+  - pytest>=7.0 ; extra == 'dev'
   requires_python: '>=3.11,<3.14'
 - conda: https://conda.anaconda.org/conda-forge/osx-arm64/scikit-image-0.26.0-np2py312ha921b1d_0.conda
   sha256: 87f56777c91af0849bbcfc0f9f0d53cbf8eb651151975782fd4f744b7ccd1739
