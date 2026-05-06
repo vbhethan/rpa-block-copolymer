@@ -1,17 +1,16 @@
-import os
+from typing import Callable, Optional
 
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import numpy as np
-import math
 import torch
 import torch.nn as nn
-from typing import Optional, Callable
-from gen_initial_conditions import (
-    generate_initial_hexagonal_ordered_structure,
-    generate_hexagonal_A_in_BC_matrix,
-)
-from rpa import BlockCopolymerFreeEnergy
-from simulation_io import SimulationData
+from tqdm import tqdm
+
+from ..free_energy import BlockCopolymerFreeEnergy
+from ..simulation_io import SimulationData
+
+
+def _model_real_dtype(model) -> torch.dtype:
+    return model.delta_phi.dtype
 
 
 def backtracking_line_search_phi(
@@ -23,7 +22,7 @@ def backtracking_line_search_phi(
     alpha_init: float = 1.0,
     beta: float = 0.5,
     c: float = 1e-4,
-    min_alpha: float = 1e-14,
+    min_alpha: float = None,
     Gamma_ij: torch.Tensor | None = None,
 ) -> tuple[float, torch.Tensor, float]:
     """
@@ -32,6 +31,8 @@ def backtracking_line_search_phi(
     Checks both the Armijo condition and positivity of the full densities
     (to keep the log term well-defined).
     """
+    if min_alpha is None:
+        min_alpha = 1e-14 if _model_real_dtype(model) == torch.float64 else 1e-7
     slope = (proj_grad * direction).sum().item()
     if slope >= 0:
         return 0.0, delta_phi, current_F
@@ -50,7 +51,7 @@ def backtracking_line_search_phi(
             continue
 
         with torch.no_grad():
-            F_candidate = model(candidate, Gamma_ij=Gamma_ij).item()
+            F_candidate = model(candidate, Gamma_ij=Gamma_ij, project=False).item()
 
         if F_candidate <= current_F + c * alpha * slope:
             return alpha, candidate, F_candidate
@@ -69,7 +70,7 @@ def backtracking_line_search_box(
     alpha_init: float = 0.1,
     beta: float = 0.5,
     c: float = 1e-4,
-    min_alpha: float = 1e-10,
+    min_alpha: float = None,
     max_box_ratio: float = 2.0,
 ) -> tuple[float, float]:
     """
@@ -83,6 +84,8 @@ def backtracking_line_search_box(
     grad_log_L : torch.Tensor
         Gradient w.r.t. log_L, shape (ndim,)
     """
+    if min_alpha is None:
+        min_alpha = 1e-10 if _model_real_dtype(model) == torch.float64 else 1e-6
     if grad_log_L.norm().item() <= 0:
         return 0.0, current_F
 
@@ -166,7 +169,7 @@ def optimize_joint(
     box_lengths_trajectory = []
     converged = False
 
-    for outer in range(n_outer):
+    for outer in tqdm(range(n_outer)):
         # =================================================================
         # Phase 1: Optimize density field with fixed box (PGD)
         # =================================================================
@@ -177,10 +180,13 @@ def optimize_joint(
             Gamma_ij_cached = model._compute_gamma_ij(K2)
 
         for inner in range(n_inner_phi):
-            delta_phi_var = delta_phi.clone().detach().requires_grad_(True)
-            F_val = model(delta_phi_var, Gamma_ij=Gamma_ij_cached)
-            (raw_grad,) = torch.autograd.grad(F_val, delta_phi_var)
+            # Enable grad in-place — no clone needed since delta_phi is a detached leaf
+            delta_phi.requires_grad_(True)
+            F_val = model(delta_phi, Gamma_ij=Gamma_ij_cached, project=False)
+            (raw_grad,) = torch.autograd.grad(F_val, delta_phi)
             current_F = F_val.item()
+            # Detach before arithmetic so line-search tensors stay out of the graph
+            delta_phi = delta_phi.detach()
 
             proj_grad = model._project_order_parameter(raw_grad)
             grad_phi_norm = proj_grad.norm().item()
@@ -189,7 +195,7 @@ def optimize_joint(
                 break
 
             if use_line_search:
-                _, delta_phi, _ = backtracking_line_search_phi(
+                _, delta_phi, current_F = backtracking_line_search_phi(
                     model,
                     delta_phi,
                     -proj_grad,
@@ -228,7 +234,7 @@ def optimize_joint(
                 break
 
             if use_line_search:
-                _, _ = backtracking_line_search_box(
+                _, current_F = backtracking_line_search_box(
                     model,
                     delta_phi,
                     current_F,
@@ -242,23 +248,20 @@ def optimize_joint(
         # =================================================================
         # Logging and convergence check
         # =================================================================
-        with torch.no_grad():
-            F_current = model(delta_phi).item()
-
-        F_trajectory.append(F_current)
+        F_trajectory.append(current_F)
         phi_trajectory.append(delta_phi)
         box_lengths_trajectory.append(model.L.tolist())
 
         if outer % log_every == 0:
             L_str = ", ".join(f"L{d}={v:.6f}" for d, v in enumerate(model.L.tolist()))
             print(
-                f"Outer {outer:4d} | F = {F_current:.6e} | "
+                f"Outer {outer:4d} | F = {current_F:.6e} | "
                 f"|grad_phi| = {grad_phi_norm:.4e} | |grad_L| = {grad_box_norm:.4e} | "
                 f"{L_str}"
             )
 
         if callback is not None:
-            callback(outer, model, F_current, grad_phi_norm, grad_box_norm)
+            callback(outer, model, current_F, grad_phi_norm, grad_box_norm)
 
         if grad_phi_norm < tol_grad_phi and grad_box_norm < tol_grad_box:
             converged = True

@@ -12,7 +12,13 @@ numpy = ">=1.24"
 h5py = ">=3.8"
 matplotlib = ">=3.7"
 pytest = ">=7.0"
+scikit-image = ">=0.26.0,<0.27"
+tqdm = ">=4.65"
+
+[pypi-dependencies]
+rpa = { path = ".", editable = true }
 
 [tasks]
 test = "pytest tests/ -v"
-gen-input = "python generate_input.py"
+gen-input = "python scripts/generate_input.py"
+optimize = "python scripts/optimize_density.py"

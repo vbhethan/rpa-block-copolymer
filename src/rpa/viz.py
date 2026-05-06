@@ -1,12 +1,11 @@
-import os
-
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from rpa import BlockCopolymerFreeEnergy
-from simulation_io import SimulationData
 from glob import glob
+
+import matplotlib.pyplot as plt
+import numpy as np
+import torch
+
+from .free_energy import BlockCopolymerFreeEnergy
+from .simulation_io import SimulationData
 
 
 def load_delta_phi(filename: str) -> torch.Tensor:
@@ -80,26 +79,3 @@ def detect_trial_number(id_string: str) -> int:
         return len(previous_trials)
 
 
-if __name__ == "__main__":
-    result = SimulationData.from_hdf5("output.h5")
-    print(result.phi.shape)
-    block_fractions = result.block_fractions.flatten()
-    chi_matrix = result.chi_matrix.flatten()
-    block_id = "_".join([f"{v:.3f}" for v in block_fractions.tolist()])
-    chi_id = "_".join([f"{v:.3f}" for v in chi_matrix.tolist()])
-    id_string = f"f_{block_id}_chi_{chi_id}"
-    fig, ax = plt.subplots()
-    plot_simulation_result(result, fig, ax)
-    block_fraction_string, chi_matrix_string = generate_annotation_str(result)
-    tt = f"Block fractions: {block_fraction_string}\nChi matrix: {chi_matrix_string}"
-    print(tt)
-    trial_number = detect_trial_number(id_string)
-    if result.converged:
-        print(
-            f"Saving visualization to visualizations/vis_{id_string}_{trial_number}.png"
-        )
-        fig.savefig(f"visualizations/vis_{id_string}_{trial_number}.png")
-    else:
-        print("result was not converged, just showing the last frame")
-
-    plt.show()

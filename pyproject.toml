@@ -1,0 +1,20 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "rpa"
+version = "0.1.0"
+description = "RPA free-energy computation and optimization for block copolymer systems"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+    "torch>=2.0",
+    "numpy>=1.24",
+    "h5py>=3.8",
+    "matplotlib>=3.7",
+    "scikit-image>=0.26,<0.27",
+    "tqdm",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/rpa"]
