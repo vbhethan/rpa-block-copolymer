@@ -119,6 +119,102 @@ def backtracking_line_search_box(
     return 0.0, current_F
 
 
+def optimize_phi_only(
+    model: nn.Module,
+    n_steps: int = 2000,
+    lr_phi: float = 0.1,
+    tol_grad: float = 1e-6,
+) -> SimulationData:
+    """
+    Projected gradient descent on delta_phi with box lengths held fixed.
+
+    Parameters
+    ----------
+    model : BlockCopolymerFreeEnergy
+        Box lengths are not modified; optimize_box may be True or False.
+    n_steps : int
+        Maximum number of PGD steps.
+    lr_phi : float
+        Initial step size passed to the backtracking line search.
+    tol_grad : float
+        Stop when ||projected grad|| < tol_grad.
+    log_every : int
+        Print a status line every this many steps.
+
+    Returns
+    -------
+    SimulationData
+        Trajectory of F and phi at each step; box_lengths is fixed and
+        broadcast across all frames.
+    """
+    delta_phi = model.delta_phi.data.detach().clone()
+
+    with torch.no_grad():
+        if model.optimize_box:
+            K2 = model._compute_K2(model.L)
+            Gamma_ij = model._compute_gamma_ij(K2)
+        else:
+            Gamma_ij = model._Gamma_ij_cached
+
+    F_trajectory = []
+    phi_trajectory = []
+    converged = False
+    grad_norm = float("inf")
+
+    with torch.no_grad():
+        current_F = model(delta_phi, Gamma_ij=Gamma_ij, project=False).item()
+
+    pbar = tqdm(range(n_steps))
+
+    for step in pbar:
+        pbar.set_description(
+            f"Step {step:4d} | F = {current_F:.6e} | |grad_phi| = {grad_norm:.4e}"
+        )
+        delta_phi.requires_grad_(True)
+        F_val = model(delta_phi, Gamma_ij=Gamma_ij, project=False)
+        (raw_grad,) = torch.autograd.grad(F_val, delta_phi)
+        current_F = F_val.item()
+        delta_phi = delta_phi.detach()
+
+        proj_grad = model._project_order_parameter(raw_grad)
+        grad_norm = proj_grad.norm().item()
+
+        F_trajectory.append(current_F)
+        phi_trajectory.append(delta_phi.cpu().numpy())
+
+        if grad_norm < tol_grad:
+            converged = True
+            break
+
+        _, delta_phi, current_F = backtracking_line_search_phi(
+            model,
+            delta_phi,
+            -proj_grad,
+            current_F,
+            proj_grad,
+            alpha_init=lr_phi,
+            Gamma_ij=Gamma_ij,
+        )
+
+    if converged:
+        print(f"Converged at step {step}")
+    else:
+        print(f"Did not converge after {n_steps} steps")
+
+    model.delta_phi.data.copy_(delta_phi)
+
+    result = SimulationData.from_model(model)
+    n = len(F_trajectory)
+    result.F = np.array(F_trajectory)
+    result.phi = np.array(phi_trajectory)
+    box_lengths = model.L.detach().cpu().tolist()
+    result.box_lengths = np.broadcast_to(
+        np.array(box_lengths)[np.newaxis], (n, len(box_lengths))
+    ).copy()
+    result.converged = converged
+    return result
+
+
 def optimize_box_only(
     model: nn.Module,
     n_steps: int = 500,
