@@ -123,10 +123,15 @@ def optimize_phi_only(
     model: nn.Module,
     n_steps: int = 2000,
     lr_phi: float = 0.1,
-    tol_grad: float = 1e-6,
+    tol_F: float = 1e-6,
+    patience: int = 50,
 ) -> SimulationData:
     """
     Projected gradient descent on delta_phi with box lengths held fixed.
+
+    Convergence is declared when the free energy has not changed by more than
+    ``tol_F`` for ``patience`` consecutive steps, which handles the small
+    oscillations that appear near convergence better than a gradient norm test.
 
     Parameters
     ----------
@@ -136,10 +141,10 @@ def optimize_phi_only(
         Maximum number of PGD steps.
     lr_phi : float
         Initial step size passed to the backtracking line search.
-    tol_grad : float
-        Stop when ||projected grad|| < tol_grad.
-    log_every : int
-        Print a status line every this many steps.
+    tol_F : float
+        Convergence threshold on |F - F_ref|.
+    patience : int
+        Number of consecutive steps within tol_F required to stop.
 
     Returns
     -------
@@ -160,6 +165,8 @@ def optimize_phi_only(
     phi_trajectory = []
     converged = False
     grad_norm = float("inf")
+    stall_count = 0
+    F_ref = float("inf")
 
     with torch.no_grad():
         current_F = model(delta_phi, Gamma_ij=Gamma_ij, project=False).item()
@@ -168,7 +175,7 @@ def optimize_phi_only(
 
     for step in pbar:
         pbar.set_description(
-            f"Step {step:4d} | F = {current_F:.6e} | |grad_phi| = {grad_norm:.4e}"
+            f"Step {step:4d} | F = {current_F:.6e} | |grad_phi| = {grad_norm:.4e} | stall = {stall_count:02d}/{patience}"
         )
         delta_phi.requires_grad_(True)
         F_val = model(delta_phi, Gamma_ij=Gamma_ij, project=False)
@@ -182,7 +189,13 @@ def optimize_phi_only(
         F_trajectory.append(current_F)
         phi_trajectory.append(delta_phi.cpu().numpy())
 
-        if grad_norm < tol_grad:
+        if abs(current_F - F_ref) < tol_F:
+            stall_count += 1
+        else:
+            stall_count = 0
+            F_ref = current_F
+
+        if stall_count >= patience:
             converged = True
             break
 
@@ -197,7 +210,7 @@ def optimize_phi_only(
         )
 
     if converged:
-        print(f"Converged at step {step}")
+        print(f"Converged at step {step} (F stable for {patience} steps)")
     else:
         print(f"Did not converge after {n_steps} steps")
 
