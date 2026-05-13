@@ -71,7 +71,7 @@ if __name__ == "__main__":
     p.add_argument(
         "--n_inner_box",
         type=int,
-        default=10,
+        default=50,
         help="Number of inner iterations for box lengths",
     )
     p.add_argument(
@@ -133,7 +133,9 @@ if __name__ == "__main__":
 
     simulation_data = SimulationData.from_hdf5(args.input_file)
 
-    model = simulation_data.build_model(optimize_box=True, dtype=dtype, device=args.device)
+    model = simulation_data.build_model(
+        optimize_box=True, dtype=dtype, device=args.device
+    )
 
     print("initial box lengths:", model.L.tolist())
     print("initial free energy:", model(model.get_order_parameters()).item())
@@ -148,7 +150,6 @@ if __name__ == "__main__":
         tol_grad_phi=tol_grad_phi,
         tol_grad_box=tol_grad_box,
         log_every=args.log_every,
-        use_line_search=True,
         box_grad_scale=args.box_grad_scale,
     )
 

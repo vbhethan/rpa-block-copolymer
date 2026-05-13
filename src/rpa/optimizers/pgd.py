@@ -337,15 +337,19 @@ def optimize_joint(
     box_grad_scale: float = 10,
     tol_grad_phi: float = 1e-6,
     tol_grad_box: float = 1e-7,
+    tol_F_phi: float = 1e-6,
+    patience_phi: int = 50,
     log_every: int = 10,
     callback: Optional[Callable] = None,
 ) -> SimulationData:
     """
     Alternating projected gradient descent for density + box optimization.
 
-    Each outer iteration delegates to optimize_phi_only (n_inner_phi steps,
-    box fixed) then optimize_box_only (up to n_inner_box steps, phi fixed).
-    Outer convergence is checked by gradient norms after both inner phases.
+    Each outer iteration delegates to optimize_phi_only (up to n_inner_phi
+    steps, box fixed) then optimize_box_only (up to n_inner_box steps, phi
+    fixed). Each inner phase may terminate early on its own convergence
+    criterion. Outer convergence is checked by gradient norms after both
+    inner phases complete.
 
     Parameters
     ----------
@@ -354,13 +358,17 @@ def optimize_joint(
     n_outer : int
         Number of outer (alternating) iterations
     n_inner_phi : int
-        Number of PGD steps for density per outer iteration
+        Maximum PGD steps for density per outer iteration
     n_inner_box : int
-        Number of GD steps for box per outer iteration
+        Maximum GD steps for box per outer iteration
     lr_phi, lr_box : float
         Initial step sizes passed to the backtracking line searches
     tol_grad_phi, tol_grad_box : float
         Convergence tolerances on projected gradient norms (outer loop)
+    tol_F_phi : float
+        Free-energy stall threshold for the inner phi optimization
+    patience_phi : int
+        Consecutive steps within tol_F_phi required to stop the inner phi loop
     """
     if not model.optimize_box:
         raise ValueError("model.optimize_box must be True for joint optimization")
@@ -376,7 +384,8 @@ def optimize_joint(
             model,
             n_steps=n_inner_phi,
             lr_phi=lr_phi,
-            tol_F=0.0,  # never stop early; outer loop owns convergence
+            tol_F=tol_F_phi,
+            patience=patience_phi,
             silent=True,
         )
 
