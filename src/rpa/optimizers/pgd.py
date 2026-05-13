@@ -125,6 +125,7 @@ def optimize_phi_only(
     lr_phi: float = 0.1,
     tol_F: float = 1e-6,
     patience: int = 50,
+    silent: bool = False,
 ) -> SimulationData:
     """
     Projected gradient descent on delta_phi with box lengths held fixed.
@@ -171,12 +172,13 @@ def optimize_phi_only(
     with torch.no_grad():
         current_F = model(delta_phi, Gamma_ij=Gamma_ij, project=False).item()
 
-    pbar = tqdm(range(n_steps))
+    pbar = tqdm(range(n_steps), disable=silent)
 
     for step in pbar:
-        pbar.set_description(
-            f"Step {step:4d} | F = {current_F:.6e} | |grad_phi| = {grad_norm:.4e} | stall = {stall_count:02d}/{patience}"
-        )
+        if not silent:
+            pbar.set_description(
+                f"Step {step:4d} | F = {current_F:.6e} | |grad_phi| = {grad_norm:.4e} | stall = {stall_count:02d}/{patience}"
+            )
         delta_phi.requires_grad_(True)
         F_val = model(delta_phi, Gamma_ij=Gamma_ij, project=False)
         (raw_grad,) = torch.autograd.grad(F_val, delta_phi)
@@ -209,10 +211,11 @@ def optimize_phi_only(
             Gamma_ij=Gamma_ij,
         )
 
-    if converged:
-        print(f"Converged at step {step} (F stable for {patience} steps)")
-    else:
-        print(f"Did not converge after {n_steps} steps")
+    if not silent:
+        if converged:
+            print(f"Converged at step {step} (F stable for {patience} steps)")
+        else:
+            print(f"Did not converge after {n_steps} steps")
 
     model.delta_phi.data.copy_(delta_phi)
 
@@ -235,6 +238,7 @@ def optimize_box_only(
     box_grad_scale: float = 10.0,
     tol_grad: float = 1e-6,
     log_every: int = 50,
+    silent: bool = False,
 ) -> SimulationData:
     """
     Gradient descent on box lengths with delta_phi held fixed.
@@ -273,7 +277,7 @@ def optimize_box_only(
     with torch.no_grad():
         current_F = model(delta_phi, project=False).item()
 
-    for step in tqdm(range(n_steps)):
+    for step in tqdm(range(n_steps), disable=silent):
         model.log_L.requires_grad_(True)
         F_val = model(delta_phi, project=False)
         F_val.backward()
@@ -287,7 +291,7 @@ def optimize_box_only(
         F_trajectory.append(current_F)
         box_lengths_trajectory.append(model.L.detach().cpu().tolist())
 
-        if step % log_every == 0:
+        if not silent and step % log_every == 0:
             L_str = ", ".join(f"L{d}={v:.6f}" for d, v in enumerate(model.L.tolist()))
             print(
                 f"Step {step:4d} | F = {current_F:.6e} | "
@@ -307,10 +311,11 @@ def optimize_box_only(
             alpha_init=lr_box,
         )
 
-    if converged:
-        print(f"Converged at step {step}")
-    else:
-        print(f"Did not converge after {n_steps} steps")
+    if not silent:
+        if converged:
+            print(f"Converged at step {step}")
+        else:
+            print(f"Did not converge after {n_steps} steps")
 
     result = SimulationData.from_model(model)
     n = len(F_trajectory)
@@ -332,21 +337,15 @@ def optimize_joint(
     box_grad_scale: float = 10,
     tol_grad_phi: float = 1e-6,
     tol_grad_box: float = 1e-7,
-    use_line_search: bool = True,
     log_every: int = 10,
     callback: Optional[Callable] = None,
 ) -> SimulationData:
     """
     Alternating projected gradient descent for density + box optimization.
 
-    The algorithm alternates between:
-      1. Many inner steps optimizing delta_phi with fixed box (PGD)
-      2. A few steps optimizing box lengths with fixed density (standard GD)
-
-    This separation exploits the fact that:
-      - The constraint set is independent of box dimensions
-      - Gamma_ij only needs recomputing when the box changes
-      - The density landscape is smoother than the box landscape
+    Each outer iteration delegates to optimize_phi_only (n_inner_phi steps,
+    box fixed) then optimize_box_only (up to n_inner_box steps, phi fixed).
+    Outer convergence is checked by gradient norms after both inner phases.
 
     Parameters
     ----------
@@ -359,101 +358,57 @@ def optimize_joint(
     n_inner_box : int
         Number of GD steps for box per outer iteration
     lr_phi, lr_box : float
-        Initial step sizes (used as starting points for line search)
+        Initial step sizes passed to the backtracking line searches
     tol_grad_phi, tol_grad_box : float
-        Convergence tolerances on projected gradient norms
+        Convergence tolerances on projected gradient norms (outer loop)
     """
     if not model.optimize_box:
         raise ValueError("model.optimize_box must be True for joint optimization")
 
-    # Initialize containers for the F, phi, and box_length trajectories to pass into SimulationData object later
     F_trajectory = []
     phi_trajectory = []
     box_lengths_trajectory = []
     converged = False
 
     for outer in tqdm(range(n_outer)):
-        # =================================================================
-        # Phase 1: Optimize density field with fixed box (PGD)
-        # =================================================================
-        delta_phi = model.delta_phi.data.clone()
+        # Phase 1: optimize density field with fixed box
+        optimize_phi_only(
+            model,
+            n_steps=n_inner_phi,
+            lr_phi=lr_phi,
+            tol_F=0.0,  # never stop early; outer loop owns convergence
+            silent=True,
+        )
 
+        # Phase 2: optimize box dimensions with fixed density
+        optimize_box_only(
+            model,
+            n_steps=n_inner_box,
+            lr_box=lr_box,
+            box_grad_scale=box_grad_scale,
+            tol_grad=tol_grad_box,
+            silent=True,
+        )
+
+        # Compute gradient norms for logging and outer convergence check
+        delta_phi = model.delta_phi.data.detach()
         with torch.no_grad():
             K2 = model._compute_K2(model.L)
-            Gamma_ij_cached = model._compute_gamma_ij(K2)
+            Gamma_ij = model._compute_gamma_ij(K2)
+        delta_phi_var = delta_phi.clone().requires_grad_(True)
+        F_val = model(delta_phi_var, Gamma_ij=Gamma_ij, project=False)
+        (raw_grad,) = torch.autograd.grad(F_val, delta_phi_var)
+        current_F = F_val.item()
+        grad_phi_norm = model._project_order_parameter(raw_grad).norm().item()
 
-        for inner in range(n_inner_phi):
-            # Enable grad in-place — no clone needed since delta_phi is a detached leaf
-            delta_phi.requires_grad_(True)
-            F_val = model(delta_phi, Gamma_ij=Gamma_ij_cached, project=False)
-            (raw_grad,) = torch.autograd.grad(F_val, delta_phi)
-            current_F = F_val.item()
-            # Detach before arithmetic so line-search tensors stay out of the graph
-            delta_phi = delta_phi.detach()
+        model.log_L.requires_grad_(True)
+        model(delta_phi).backward()
+        grad_box_norm = model.log_L.grad.norm().item()
+        model.log_L.grad = None
 
-            proj_grad = model._project_order_parameter(raw_grad)
-            grad_phi_norm = proj_grad.norm().item()
-
-            if grad_phi_norm < tol_grad_phi:
-                break
-
-            if use_line_search:
-                _, delta_phi, current_F = backtracking_line_search_phi(
-                    model,
-                    delta_phi,
-                    -proj_grad,
-                    current_F,
-                    proj_grad,
-                    alpha_init=lr_phi,
-                    Gamma_ij=Gamma_ij_cached,
-                )
-            else:
-                delta_phi = delta_phi - lr_phi * proj_grad
-                delta_phi = model._project_order_parameter(delta_phi)
-                rho = delta_phi + model._f_expanded() * model.phi_bar
-                if rho.min().item() < 1e-10:
-                    delta_phi = delta_phi * 0.9
-                    delta_phi = model._project_order_parameter(delta_phi)
-
-        model.delta_phi.data.copy_(delta_phi)
-
-        # =================================================================
-        # Phase 2: Optimize box dimensions with fixed density (standard GD)
-        # =================================================================
-        for inner_box in range(n_inner_box):
-            model.log_L.requires_grad_(True)
-
-            F_val = model(delta_phi.detach())
-            F_val.backward()
-
-            grad_log_L = model.log_L.grad.clone()
-            current_F = F_val.item()
-
-            model.log_L.grad = None
-
-            grad_box_norm = grad_log_L.norm().item()
-
-            if grad_box_norm < tol_grad_box:
-                break
-
-            if use_line_search:
-                _, current_F = backtracking_line_search_box(
-                    model,
-                    delta_phi,
-                    current_F,
-                    grad_log_L,
-                    grad_scale=box_grad_scale,
-                    alpha_init=lr_box,
-                )
-            else:
-                model.log_L.data -= lr_box * box_grad_scale * grad_log_L
-
-        # =================================================================
-        # Logging and convergence check
-        # =================================================================
         F_trajectory.append(current_F)
-        phi_trajectory.append(delta_phi.detach().cpu().numpy())
-        box_lengths_trajectory.append(model.L.tolist())
+        phi_trajectory.append(delta_phi.cpu().numpy())
+        box_lengths_trajectory.append(model.L.detach().cpu().tolist())
 
         if outer % log_every == 0:
             L_str = ", ".join(f"L{d}={v:.6f}" for d, v in enumerate(model.L.tolist()))
@@ -472,9 +427,9 @@ def optimize_joint(
 
     if converged:
         print("Converged at outer iteration", outer)
-        converged = True
     else:
         print("Did not converge after", n_outer, "outer iterations")
+
     result = SimulationData.from_model(model)
     result.F = np.array(F_trajectory)
     result.phi = np.array(phi_trajectory)
