@@ -339,6 +339,8 @@ def optimize_joint(
     tol_grad_box: float = 1e-7,
     tol_F_phi: float = 1e-6,
     patience_phi: int = 50,
+    tol_F_outer: float = 1e-6,
+    patience_outer: int = 10,
     log_every: int = 10,
     callback: Optional[Callable] = None,
 ) -> SimulationData:
@@ -348,8 +350,9 @@ def optimize_joint(
     Each outer iteration delegates to optimize_phi_only (up to n_inner_phi
     steps, box fixed) then optimize_box_only (up to n_inner_box steps, phi
     fixed). Each inner phase may terminate early on its own convergence
-    criterion. Outer convergence is checked by gradient norms after both
-    inner phases complete.
+    criterion. Outer convergence is declared when either gradient norms fall
+    below their tolerances or the free energy has not changed by more than
+    tol_F_outer for patience_outer consecutive outer iterations.
 
     Parameters
     ----------
@@ -369,6 +372,10 @@ def optimize_joint(
         Free-energy stall threshold for the inner phi optimization
     patience_phi : int
         Consecutive steps within tol_F_phi required to stop the inner phi loop
+    tol_F_outer : float
+        Free-energy stall threshold for the outer loop
+    patience_outer : int
+        Consecutive outer iterations within tol_F_outer required to stop
     """
     if not model.optimize_box:
         raise ValueError("model.optimize_box must be True for joint optimization")
@@ -377,6 +384,8 @@ def optimize_joint(
     phi_trajectory = []
     box_lengths_trajectory = []
     converged = False
+    stall_count = 0
+    F_ref = float("inf")
 
     for outer in tqdm(range(n_outer)):
         # Phase 1: optimize density field with fixed box
@@ -430,7 +439,17 @@ def optimize_joint(
         if callback is not None:
             callback(outer, model, current_F, grad_phi_norm, grad_box_norm)
 
+        if abs(current_F - F_ref) < tol_F_outer:
+            stall_count += 1
+        else:
+            stall_count = 0
+            F_ref = current_F
+
         if grad_phi_norm < tol_grad_phi and grad_box_norm < tol_grad_box:
+            converged = True
+            break
+
+        if stall_count >= patience_outer:
             converged = True
             break
 

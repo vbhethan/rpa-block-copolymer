@@ -117,6 +117,13 @@ if __name__ == "__main__":
         help="Torch device to use, e.g. 'cpu', 'cuda', 'cuda:0' (default: cpu)",
     )
 
+    p.add_argument(
+        "--patience_outer",
+        type=int,
+        default=5,
+        help="Number of outer iterations to wait for convergence",
+    )
+
     args = p.parse_args()
 
     dtype = torch.float32 if args.dtype == "float32" else torch.float64
@@ -151,6 +158,7 @@ if __name__ == "__main__":
         tol_grad_box=tol_grad_box,
         log_every=args.log_every,
         box_grad_scale=args.box_grad_scale,
+        patience_outer=args.patience_outer,
     )
 
     result.to_hdf5(args.output_file)
