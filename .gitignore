@@ -25,6 +25,10 @@ __pycache__/
 .venv
 visualizations/
 local/
+context/
+
+# marimo
+__marimo__ 
 
 # Emacs
 *~
