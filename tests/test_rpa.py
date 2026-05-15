@@ -145,6 +145,78 @@ def test_box_dimensions_property() -> None:
     print("box dimensions property test passed")
 
 
+def test_conformational_asymmetry() -> None:
+    """Non-uniform Kuhn lengths produce correct buffer, finite output, and differ from symmetric."""
+    torch.manual_seed(7)
+    N = 100
+    f_A = 0.4
+    chi = 15.0 / N
+    chi_matrix = torch.tensor([[0.0, chi], [chi, 0.0]], dtype=torch.float64)
+    l_ij_matrix = torch.zeros((2, 2), dtype=torch.float64)
+    block_fractions = torch.tensor([f_A, 1.0 - f_A], dtype=torch.float64)
+
+    b_asym = [1.0, 2.0]
+    model_asym = BlockCopolymerFreeEnergy(
+        N=N,
+        b=b_asym,
+        chi_matrix=chi_matrix,
+        l_ij_matrix=l_ij_matrix,
+        block_fractions=block_fractions,
+        grid_shape=(32,),
+    )
+
+    # Buffer has correct shape and values
+    assert model_asym.b.shape == (2,), f"Expected b shape (2,), got {model_asym.b.shape}"
+    assert torch.allclose(model_asym.b, torch.tensor(b_asym, dtype=torch.float64))
+
+    # Forward pass and gradients are finite
+    F_asym, grad_asym = _run_forward_and_gradient(model_asym)
+    assert grad_asym.shape == (2, 32)
+
+    # Symmetric model with same seed
+    torch.manual_seed(7)
+    model_sym = BlockCopolymerFreeEnergy(
+        N=N,
+        chi_matrix=chi_matrix,
+        l_ij_matrix=l_ij_matrix,
+        block_fractions=block_fractions,
+        grid_shape=(32,),
+    )
+    assert torch.allclose(model_sym.b, torch.ones(2, dtype=torch.float64))
+
+    # Evaluate both at the same field — free energies must differ
+    delta_phi = model_sym.get_order_parameters()
+    F_sym = model_sym(delta_phi)
+    F_asym_same_phi = model_asym(delta_phi)
+    assert not torch.isclose(F_sym, F_asym_same_phi), (
+        "Symmetric and asymmetric models should give different free energies "
+        f"(got F_sym={F_sym.item():.6f}, F_asym={F_asym_same_phi.item():.6f})"
+    )
+
+    # Invalid b: wrong length
+    try:
+        BlockCopolymerFreeEnergy(
+            N=N, b=[1.0], chi_matrix=chi_matrix,
+            l_ij_matrix=l_ij_matrix, block_fractions=block_fractions, grid_shape=(16,),
+        )
+        assert False, "Should have raised ValueError for wrong-length b"
+    except ValueError:
+        pass
+
+    # Invalid b: non-positive entry
+    try:
+        BlockCopolymerFreeEnergy(
+            N=N, b=[1.0, -0.5], chi_matrix=chi_matrix,
+            l_ij_matrix=l_ij_matrix, block_fractions=block_fractions, grid_shape=(16,),
+        )
+        assert False, "Should have raised ValueError for non-positive b"
+    except ValueError:
+        pass
+
+    print(f"[asymmetric b] F_sym={F_sym.item():.6f}, F_asym={F_asym_same_phi.item():.6f}")
+    print("conformational asymmetry test passed")
+
+
 if __name__ == "__main__":
     test_forward_and_gradients_1d()
     test_forward_and_gradients_2d()
