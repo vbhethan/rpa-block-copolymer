@@ -59,7 +59,6 @@ def make_lamellar_model() -> BlockCopolymerFreeEnergy:
 
     model = BlockCopolymerFreeEnergy(
         N=N,
-        b=b,
         block_fractions=block_fractions,
         chi_matrix=chi_matrix,
         l_ij_matrix=l_ij_matrix,

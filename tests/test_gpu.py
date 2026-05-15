@@ -134,7 +134,7 @@ def test_build_model_cuda() -> None:
     """SimulationData.build_model places all tensors on CUDA."""
     data = SimulationData(
         N=100,
-        b=1.0,
+        b=np.array([1.0, 1.0]),
         block_fractions=np.array([0.5, 0.5]),
         chi_matrix=np.array([[0.0, 0.2], [0.2, 0.0]]),
         l_ij_matrix=np.zeros((2, 2)),
@@ -156,7 +156,7 @@ def test_build_model_cuda_with_trajectory() -> None:
     phi = np.random.default_rng(0).standard_normal((1, n, *grid_shape))
     data = SimulationData(
         N=100,
-        b=1.0,
+        b=np.array([1.0, 1.0]),
         block_fractions=np.array([0.5, 0.5]),
         chi_matrix=np.array([[0.0, 0.2], [0.2, 0.0]]),
         l_ij_matrix=np.zeros((2, 2)),

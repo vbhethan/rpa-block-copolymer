@@ -32,8 +32,8 @@ class SimulationData:
     -------------------------------
     N : int
         Total monomers per chain.
-    b : float
-        Kuhn length.
+    b : np.ndarray, shape (n_components,)
+        Per-block Kuhn lengths.
     block_fractions : np.ndarray, shape (n_components,)
     chi_matrix : np.ndarray, shape (n_components, n_components)
     l_ij_matrix : np.ndarray, shape (n_components, n_components)
@@ -51,7 +51,7 @@ class SimulationData:
 
     # --- system definition ---
     N: int = 100
-    b: float = 1.0
+    b: np.ndarray = field(default_factory=lambda: np.empty(0))
     block_fractions: np.ndarray = field(default_factory=lambda: np.empty(0))
     chi_matrix: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
     l_ij_matrix: np.ndarray = field(default_factory=lambda: np.empty((0, 0)))
@@ -100,7 +100,7 @@ class SimulationData:
         ndim = model.ndim
         return cls(
             N=model.N,
-            b=model.b,
+            b=model.b.detach().cpu().numpy().copy(),
             block_fractions=model.f_vec.detach().cpu().numpy().copy(),
             chi_matrix=model.chi_matrix.detach().cpu().numpy().copy(),
             l_ij_matrix=model.l_ij_matrix.detach().cpu().numpy().copy(),
@@ -124,7 +124,7 @@ class SimulationData:
 
             data = cls(
                 N=int(f.attrs["N"]),
-                b=float(f.attrs["b"]),
+                b=np.array(f["b"], dtype=np.float64),
                 block_fractions=np.array(f["block_fractions"], dtype=np.float64),
                 chi_matrix=np.array(f["chi_matrix"], dtype=np.float64),
                 l_ij_matrix=np.array(f["l_ij_matrix"], dtype=np.float64),
@@ -157,13 +157,13 @@ class SimulationData:
         with h5py.File(path, "w") as f:
             # --- scalar attrs ---
             f.attrs["N"] = self.N
-            f.attrs["b"] = self.b
             f.attrs["n_components"] = self.n_components
             f.attrs["phi_bar"] = self.phi_bar
             f.attrs["grid_shape"] = list(self.grid_shape)
             f.attrs["converged"] = self.converged
 
             # --- matrix / vector datasets ---
+            f.create_dataset("b", data=self.b)
             f.create_dataset("block_fractions", data=self.block_fractions)
             f.create_dataset("chi_matrix", data=self.chi_matrix)
             f.create_dataset("l_ij_matrix", data=self.l_ij_matrix)
@@ -222,7 +222,7 @@ class SimulationData:
 
         model = BlockCopolymerFreeEnergy(
             N=self.N,
-            b=self.b,
+            b=self.b.tolist(),
             block_fractions=torch.from_numpy(self.block_fractions),
             chi_matrix=torch.from_numpy(self.chi_matrix),
             l_ij_matrix=torch.from_numpy(self.l_ij_matrix),

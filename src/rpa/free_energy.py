@@ -25,7 +25,10 @@ class BlockCopolymerFreeEnergy(nn.Module):
     - 2nd order mixing entropy expansion (real space)
 
     This module supports arbitrary chain architectures through the distance
-    matrix l_ij, which encodes the contour distance between blocks i and j.
+    matrix l_ij, which encodes the effective squared path length between blocks
+    i and j: l_ij_matrix[i,j] = N * sum_{k on path i→j} f_k * b_k^2.
+    For conformationally symmetric chains (all b_k equal) this reduces to
+    l_ij * N * b^2 where l_ij is the dimensionless contour fraction.
 
     Physical constraints:
     1. Local incompressibility: sum_i rho_i(r) = phi_bar at every point
@@ -36,8 +39,9 @@ class BlockCopolymerFreeEnergy(nn.Module):
     ----------
     N : int
         Total number of monomers in the polymer chain
-    b : float
-        Kuhn length (statistical segment length)
+    b : list of float, optional
+        Kuhn lengths per block, length must equal n_components.
+        Defaults to [1.0, ..., 1.0] when None.
     block_fractions : list or array
         Volume fractions of each block [f_A, f_B, ...], must sum to 1
     chi_matrix : array-like
@@ -60,7 +64,7 @@ class BlockCopolymerFreeEnergy(nn.Module):
     def __init__(
         self,
         N: int = 100,
-        b: float = 1.0,
+        b: list[float] | None = None,
         block_fractions: list = None,
         chi_matrix: torch.Tensor = None,
         l_ij_matrix: torch.Tensor = None,
@@ -115,9 +119,21 @@ class BlockCopolymerFreeEnergy(nn.Module):
 
         # Store physical parameters
         self.N = N
-        self.b = b
         self.n_components = n_components
         self.phi_bar = phi_bar
+
+        # Normalize and validate per-block Kuhn lengths
+        if b is None:
+            b_list = [1.0] * n_components
+        else:
+            b_list = [float(x) for x in b]
+        if len(b_list) != n_components:
+            raise ValueError(
+                f"b must have length {n_components}, got {len(b_list)}"
+            )
+        if any(x <= 0 for x in b_list):
+            raise ValueError("all entries of b must be positive")
+        self.register_buffer("b", torch.tensor(b_list, dtype=self.real_dtype))
 
         # Store block fractions as buffer
         f_vec = block_fractions.clone().detach()
@@ -149,7 +165,8 @@ class BlockCopolymerFreeEnergy(nn.Module):
                 )
             self._L_init = tuple(float(v) for v in box_lengths)
         else:
-            self._L_init = tuple(float(n * b / 2) for n in grid_shape)
+            b_rms = float((self.b**2 @ self.f_vec).sqrt())
+            self._L_init = tuple(float(n * b_rms / 2) for n in grid_shape)
 
         # Box optimization flag
         self.optimize_box = optimize_box
@@ -273,15 +290,15 @@ class BlockCopolymerFreeEnergy(nn.Module):
         Gamma_ij : torch.Tensor
             Vertex function of shape (*grid_shape, n_components, n_components)
         """
-        N, b = self.N, self.b
+        N = self.N
         n = self.n_components
         f = self.f_vec  # (n,)
         phi_bar = self.phi_bar
         ndim = self.ndim
 
-        # Compute xi parameters for each component: xi_i = N * f_i * b^2 * K2 / 6
-        # Shape: (*grid_shape, n)
-        xi = K2.unsqueeze(-1) * N * f * b**2 / 6
+        # Compute xi parameters for each component: xi_i = N * f_i * b_i^2 * K2 / 6
+        # self.b has shape (n,); K2.unsqueeze(-1) has shape (*grid_shape, 1) → broadcasts to (*grid_shape, n)
+        xi = K2.unsqueeze(-1) * N * f * self.b**2 / 6
 
         # Numerically stable small-x forms:
         # u(x) = (1 - exp(-x)) / x, u(0) = 1
