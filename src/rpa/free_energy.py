@@ -568,6 +568,27 @@ class BlockCopolymerFreeEnergy(nn.Module):
 
         return F_mixing_2
 
+    def set_density(self, phi: torch.Tensor) -> None:
+        """
+        Set the density profile directly from physical densities phi_i(r).
+
+        Computes delta_phi = phi - f_i * phi_bar and assigns it as the learnable
+        parameter.  The model's projection step will enforce zero-mean and
+        incompressibility constraints on the next forward pass.
+
+        Parameters
+        ----------
+        phi : torch.Tensor
+            Density profiles, shape (n_components, *grid_shape), values in [0, 1].
+        """
+        expected_shape = (self.n_components, *self.grid_shape)
+        if tuple(phi.shape) != expected_shape:
+            raise ValueError(
+                f"phi must have shape {expected_shape}, got {tuple(phi.shape)}"
+            )
+        delta_phi = phi.to(self.real_dtype).to(self.f_vec.device) - self._f_expanded() * self.phi_bar
+        self.delta_phi = nn.Parameter(delta_phi)
+
     def get_densities(self, delta_phi: torch.Tensor | None = None) -> torch.Tensor:
         """
         Get the current density profiles from order parameters.
