@@ -57,7 +57,6 @@ block_fractions = torch.tensor([f_A, f_B], dtype=DTYPE)
 
 model = BlockCopolymerFreeEnergy(
     N=N,
-    b=1.0,
     chi_matrix=chi_matrix,
     l_ij_matrix=l_ij_matrix,
     block_fractions=block_fractions,

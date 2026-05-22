@@ -97,8 +97,8 @@ def write_param_file(filepath: str, sim: SimulationData) -> None:
         f.write("  Mixture{\n")
         f.write(f"    nMonomer  {n_mon}\n")
         f.write("    monomers[\n")
-        for _ in range(n_mon):
-            f.write(f"      {sim.b:.10e}\n")
+        for i in range(n_mon):
+            f.write(f"      {sim.b[i]:.10e}\n")
         f.write("    ]\n")
 
         f.write("    nPolymer  1\n")
