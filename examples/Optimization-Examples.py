@@ -6,7 +6,6 @@ app = marimo.App()
 
 @app.cell
 def _():
-    import subprocess
     import os
 
     return (os,)
@@ -21,7 +20,6 @@ def _(os):
 
 @app.cell
 def _():
-    from rpa.free_energy import BlockCopolymerFreeEnergy
     from rpa.simulation_io import SimulationData
     from rpa.visualize import plot_diblock_isosurface
     import torch
