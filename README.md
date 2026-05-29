@@ -1,7 +1,6 @@
 # rpa-block-copolymer
 
-A PyTorch implementation of the Random Phase Approximation (RPA) free energy for block copolymer melts, with GPU-accelerated gradient-based optimization of both real-space density fields and box geometry.
-
+A PyTorch implementation of the Random Phase Approximation (RPA) free energy for block copolymer melts and optimization of density fields and box parameters.
 ## Goal of this codebase
 
 Given a multi-component block copolymer system (chain architecture, composition fractions, Flory-Huggins χ parameters, and a candidate unit cell), this code minimizes the RPA free energy with respect to:
