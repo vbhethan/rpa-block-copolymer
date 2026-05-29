@@ -25,29 +25,8 @@ Install with [pixi](https://pixi.sh):
 pixi install
 ```
 
-Generate an initial condition and run the optimizer:
-
-```bash
-pixi run gen-input      # writes input.h5
-pixi run optimize       # reads input.h5, writes result.h5
-pixi run test           # run the test suite
-```
-
-See `run-optimizer.sh` and `run-box-optimization.sh` for example CLI invocations with explicit hyperparameters. The `examples/` notebook walks through a complete optimization interactively.
-
 You can also install this package in an environment using pip. 
 
 `pip install -e .`
 
-## Source layout
-
-```
-src/rpa/
-  free_energy.py        # BlockCopolymerFreeEnergy (nn.Module) — the core physics
-  optimizers/pgd.py     # optimize_joint(): alternating PGD with backtracking line search
-  initial_conditions.py # structured ICs: BCC, FCC, hexagonal cylinders, lamellar, random
-  simulation_io.py      # SimulationData dataclass, HDF5 serialization, build_model()
-  pscf_io.py            # export fields to PSCF++ r-grid format
-  viz.py / viz_3d.py    # 2D/3D density field visualization
-```
 
