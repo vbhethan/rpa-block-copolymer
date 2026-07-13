@@ -629,6 +629,58 @@ class BlockCopolymerFreeEnergy(nn.Module):
             projected = self._get_order_parameter(delta_phi)
         return projected.detach().clone()
 
+    def residual_free_energy(
+        self,
+        delta_phi: torch.Tensor | None = None,
+        Gamma_ij: torch.Tensor | None = None,
+        project: bool = False,
+    ) -> torch.Tensor:
+        """
+        Compute the residual free energy F_res = Delta_F_int - F_mixing_2.
+
+        This is the total free energy with the ideal Flory-Huggins mixing
+        reference (the ``rho ln rho`` term) removed. It is the quantity whose
+        functional derivative enters the grand-canonical fixed-point (Picard)
+        update ``rho_i = rho_i,bulk * exp(-f_i * n_grid * dF_res/d(delta_phi_i))``.
+
+        Because F_res is quadratic in ``delta_phi`` (both Delta_F_int and
+        F_mixing_2 vanish to first order at ``delta_phi = 0``), its gradient is
+        zero at the homogeneous state, which makes that state a fixed point of
+        the update.
+
+        Parameters
+        ----------
+        delta_phi : torch.Tensor, optional
+            Order parameter field, shape (n_components, *grid_shape). If None,
+            uses the module's internal ``self.delta_phi``.
+        Gamma_ij : torch.Tensor, optional
+            Pre-computed vertex function. If provided, skips recomputation.
+        project : bool
+            If True, project ``delta_phi`` onto the constraint manifold first.
+            Defaults to False: the Picard solver handles the incompressibility
+            and mean constraints explicitly and needs the unprojected gradient.
+
+        Returns
+        -------
+        F_res : torch.Tensor
+            Scalar residual free energy (differentiable w.r.t. ``delta_phi``).
+        """
+        if project:
+            delta_phi = self._get_order_parameter(delta_phi)
+        elif delta_phi is None:
+            delta_phi = self.delta_phi
+
+        if Gamma_ij is None:
+            if self.optimize_box:
+                K2 = self._compute_K2(self.L)
+                Gamma_ij = self._compute_gamma_ij(K2)
+            else:
+                Gamma_ij = self._Gamma_ij_cached
+
+        Delta_F_int = self._compute_interaction_energy(delta_phi, Gamma_ij)
+        F_mixing_2 = self._compute_mixing_entropy_quadratic(delta_phi)
+        return Delta_F_int - F_mixing_2
+
     def get_energy_components(
         self, delta_phi: torch.Tensor | None = None
     ) -> dict[str, torch.Tensor]:
