@@ -195,23 +195,22 @@ def write_command_file(filepath: str) -> None:
 
 
 def _cell_from_box_lengths(
-    box_lengths: Sequence[float], N: int, atol: float = 1e-9
+    box_lengths: Sequence[float], N: int
 ) -> tuple[str, list[float]]:
     """Map model box lengths to a (lattice, cell_params) pair for pscf_pc.
 
     Every edge is divided by sqrt(N) (see the module note above) so the
     pscf polymer, whose block lengths sum to 1, describes the same melt as
-    the model.  If all rescaled edges are equal the lattice is reported as
-    ``cubic`` (one cell parameter); otherwise ``orthorhombic`` (three).
-    Only 3D boxes are supported here.
+    the model.  Only 3D boxes are supported here.
+
+    The lattice is set up to be "orthrhombic" for now to allow the edges to relax
+    separately
     """
     edges = [float(L) / math.sqrt(N) for L in box_lengths]
     if len(edges) != 3:
         raise NotImplementedError(
             f"Only 3D calculations are supported; got a {len(edges)}D box."
         )
-    if all(abs(e - edges[0]) <= atol for e in edges):
-        return "cubic", [edges[0]]
     return "orthorhombic", edges
 
 
@@ -225,11 +224,7 @@ def write_scft_c_rgrid(
     """Write a real-space (r-grid) concentration field file for pscf_pc.
 
     Data are written in **Fortran order** (first mesh index varies fastest),
-    matching PSCF's MeshIteratorFortran traversal — this is the ordering
-    verified to round-trip through pscf_pc in ``pscf_init_from_density``.
-    (Note: the older :func:`write_C_RGRID_from_array` writes C-order and
-    omits the space group; this function is the one to use for the SCFT
-    builder.)
+    matching PSCF
 
     Parameters
     ----------
@@ -241,7 +236,8 @@ def write_scft_c_rgrid(
     lattice : str
         Crystal system for the header (e.g. ``"cubic"``, ``"orthorhombic"``).
     cell_params : sequence of float
-        Unit-cell parameters (1 for cubic, 3 for orthorhombic).
+        Unit-cell parameters, as many as ``lattice`` defines (1 for cubic,
+        3 for orthorhombic, 6 for triclinic).
     group : str
         Space group name written to the header (default ``"P_1"``).  Must
         match ``groupName`` in the parameter file.
@@ -304,7 +300,7 @@ def write_scft_param(
 
     ``chi_matrix`` entries are written straight into ``chi(...)`` because the
     RPA model already stores chi*N and the polymer's block lengths sum to 1
-    (so N_pscf = 1); see the module note above.
+    (so N_pscf = 1)
     """
     b = list(b)
     block_fractions = list(block_fractions)
