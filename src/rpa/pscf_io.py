@@ -3,9 +3,19 @@ A set of functions to read and write pscf input and output files from data gener
 
 """
 
+from __future__ import annotations
+
+import math
+import os
+import stat
+from typing import TYPE_CHECKING, Sequence
+
 import numpy as np
 
 from .simulation_io import SimulationData
+
+if TYPE_CHECKING:
+    from .free_energy import BlockCopolymerFreeEnergy
 
 _CRYSTAL_SYSTEMS = {1: "lamellar", 2: "rectangular", 3: "orthorhombic"}
 
@@ -161,3 +171,348 @@ def write_command_file(filepath: str) -> None:
         f.write("ITERATE\n")
         f.write("WRITE_C_RGRID      out/c.rf\n")
         f.write("FINISH\n")
+
+
+# ======================================================================
+# SCFT calculation builder
+# ----------------------------------------------------------------------
+# Turn a density field from a BlockCopolymerFreeEnergy model (or an
+# explicit A-block volume-fraction field) into a self-contained pscf_pc
+# calculation directory that, when run, seeds SCFT with that density and
+# relaxes it to a nearby self-consistent solution.
+#
+# NOTE: Unit conventions.  The RPA model's ideal structure factor
+# uses the argument  xi = k^2 * N * f * b^2 / 6  and adds ``chi_matrix``
+# directly to [S_ideal]^-1, i.e. ``chi_matrix`` already holds *chi*N* (the
+# segregation strength), not the bare chi.  A pscf_pc polymer whose block
+# lengths sum to 1 has total contour length N_pscf = 1, so:
+#
+#   * chi(i, j)_pscf = chi_matrix[i, j]           (already chi*N)
+#   * block length_i = block_fractions[i]         (sum to 1)
+#   * cell edge L'_d = box_lengths[d] / sqrt(N)    (matches k^2*N*b^2)
+#
+# ======================================================================
+
+
+def _cell_from_box_lengths(
+    box_lengths: Sequence[float], N: int
+) -> tuple[str, list[float]]:
+    """Map model box lengths to a (lattice, cell_params) pair for pscf_pc.
+
+    Every edge is divided by sqrt(N) (see the module note above) so the
+    pscf polymer, whose block lengths sum to 1, describes the same melt as
+    the model.  Only 3D boxes are supported here.
+
+    The lattice is set up to be "orthrhombic" for now to allow the edges to relax
+    separately
+    """
+    edges = [float(L) / math.sqrt(N) for L in box_lengths]
+    if len(edges) != 3:
+        raise NotImplementedError(
+            f"Only 3D calculations are supported; got a {len(edges)}D box."
+        )
+    return "orthorhombic", edges
+
+
+def write_scft_c_rgrid(
+    filepath: str,
+    densities: np.ndarray,
+    lattice: str,
+    cell_params: Sequence[float],
+    group: str = "P_1",
+) -> None:
+    """Write a real-space (r-grid) concentration field file for pscf_pc.
+
+    Data are written in **Fortran order** (first mesh index varies fastest),
+    matching PSCF
+
+    Parameters
+    ----------
+    filepath : str
+        Output path (conventionally ``<dir>/in/c.rf``).
+    densities : np.ndarray, shape (n_monomer, Nx, Ny, Nz)
+        Monomer volume fractions on the real-space mesh.  Columns are
+        written in monomer order; for a diblock this is (phi_A, phi_B).
+    lattice : str
+        Crystal system for the header (e.g. ``"cubic"``, ``"orthorhombic"``).
+    cell_params : sequence of float
+        Unit-cell parameters, as many as ``lattice`` defines (1 for cubic,
+        3 for orthorhombic, 6 for triclinic).
+    group : str
+        Space group name written to the header (default ``"P_1"``).  Must
+        match ``groupName`` in the parameter file.
+    """
+    densities = np.asarray(densities, dtype=np.float64)
+    if densities.ndim != 4:
+        raise ValueError(
+            f"densities must be (n_monomer, Nx, Ny, Nz); got shape {densities.shape}"
+        )
+    n_monomer, nx, ny, nz = densities.shape
+
+    header = (
+        "format   1   0\n"
+        "dim\n"
+        f"{3:>20}\n"
+        "crystal_system\n"
+        f"{lattice:>20}\n"
+        "N_cell_param\n"
+        f"{len(cell_params):>20}\n"
+        "cell_param\n" + "".join(f"{p:.10e}".rjust(20) for p in cell_params) + "\n"
+        "group_name\n"
+        f"{group:>20}\n"
+        "N_monomer\n"
+        f"{n_monomer:>20}\n"
+        "mesh\n"
+        f"{nx:>20}{ny:>8}{nz:>8}\n"
+    )
+
+    # Fortran flatten: first mesh index fastest, matching writeRGridData.
+    cols = [densities[m].ravel(order="F") for m in range(n_monomer)]
+    with open(filepath, "w") as f:
+        f.write(header)
+        for row in zip(*cols):
+            f.write("".join(f"{v:.15e}".rjust(23) for v in row) + "\n")
+
+
+def write_scft_param(
+    filepath: str,
+    *,
+    b: Sequence[float],
+    block_fractions: Sequence[float],
+    chi_matrix: np.ndarray,
+    grid_shape: Sequence[int],
+    lattice: str,
+    cell_params: Sequence[float],
+    ds: float = 0.01,
+    epsilon: float = 1.0e-4,
+    max_itr: int = 4000,
+    max_hist: int = 50,
+    is_flexible: int = 1,
+    group: str = "P_1",
+) -> None:
+    """Write a pscf_pc parameter file for a linear diblock melt.
+
+    Reproduces the structure of the verified ``param_pt`` example: a single
+    linear AB diblock (phi = 1), an ``Interaction`` chi block, a ``Domain``
+    with ``groupName`` set (required by the basis-conversion workflow), an
+    ``AmIteratorBasis`` with a flexible cell, and a trailing ``unitCell``
+    line.  Only diblocks (2 monomers / 2 blocks) are supported.
+
+    ``chi_matrix`` entries are written straight into ``chi(...)`` because the
+    RPA model already stores chi*N and the polymer's block lengths sum to 1
+    (so N_pscf = 1)
+    """
+    b = list(b)
+    block_fractions = list(block_fractions)
+    chi = np.asarray(chi_matrix, dtype=np.float64)
+    n_mon = len(block_fractions)
+    if n_mon != 2:
+        raise NotImplementedError(
+            f"Only diblock (2-component) melts are supported; got {n_mon} components."
+        )
+
+    with open(filepath, "w") as f:
+        f.write("System{\n")
+        f.write("  Mixture{\n")
+        f.write(f"    nMonomer  {n_mon}\n")
+        f.write("    monomers[\n")
+        for bi in b:
+            f.write(f"              {bi:.10e}\n")
+        f.write("    ]\n")
+        f.write("    nPolymer  1\n")
+        f.write("    Polymer{\n")
+        f.write("      type    linear\n")
+        f.write(f"      nBlock  {n_mon}\n")
+        f.write("      blocks[\n")
+        for i, frac in enumerate(block_fractions):
+            f.write(f"              {i}  {frac:.10e}\n")
+        f.write("      ]\n")
+        f.write("      phi     1.0\n")
+        f.write("    }\n")
+        f.write(f"    ds   {ds}\n")
+        f.write("  }\n")
+
+        f.write("  Interaction{\n")
+        f.write("    chi(\n")
+        # Lower-triangular (j > i): pscf reads chi(monomer_j, monomer_i, value).
+        for i in range(n_mon):
+            for j in range(i + 1, n_mon):
+                f.write(f"         {j}   {i}   {chi[i, j]:.10e}\n")
+        f.write("    )\n")
+        f.write("  }\n")
+
+        f.write("  Domain{\n")
+        mesh_str = "".join(f"{int(m):6d}" for m in grid_shape)
+        f.write(f"    mesh    {mesh_str}\n")
+        f.write(f"    lattice        {lattice}\n")
+        f.write(f"    groupName      {group}\n")
+        f.write("  }\n")
+
+        f.write("  AmIteratorBasis{\n")
+        f.write(f"    epsilon      {epsilon:.2e}\n")
+        f.write(f"    maxItr       {max_itr}\n")
+        f.write(f"    maxHist      {max_hist}\n")
+        f.write(f"    isFlexible   {is_flexible}\n")
+        f.write("  }\n")
+        f.write("}\n")
+
+        f.write("\n")
+        cell_str = "     ".join(f"{p:.10e}" for p in cell_params)
+        f.write(f"    unitCell       {lattice}     {cell_str}\n")
+
+
+def write_scft_command(filepath: str) -> None:
+    """Write the pscf_pc command file for the r-grid-to-SCFT workflow."""
+    with open(filepath, "w") as f:
+        f.write("CHECK_RGRID_SYMMETRY   in/c.rf   1.0e-6\n")
+        f.write("RGRID_TO_BASIS         in/c.rf   out/c_in.bf\n")
+        f.write("ESTIMATE_W_BASIS       out/c_in.bf   out/w_est.bf\n")
+        f.write("READ_W_BASIS           out/w_est.bf\n")
+        f.write("ITERATE\n")
+        f.write("WRITE_W_BASIS          out/w.bf\n")
+        f.write("WRITE_C_BASIS          out/c.bf\n")
+        f.write("WRITE_C_RGRID          out/c.rf\n")
+        f.write("WRITE_THERMO           out/thermo\n")
+        f.write("FINISH\n")
+
+
+def _write_run_script(
+    filepath: str, param: str = "param", command: str = "command"
+) -> None:
+    """Write an executable ``run`` script that invokes pscf_pc."""
+    with open(filepath, "w") as f:
+        f.write("#!/bin/bash\n")
+        f.write("# Seed SCFT from in/c.rf and relax to a self-consistent solution.\n")
+        f.write("# Requires pscf_pc on PATH (see pscf_env.sh at the repo root).\n")
+        f.write(f"pscf_pc -d 3 -p {param} -c {command} -e\n")
+    st = os.stat(filepath)
+    os.chmod(filepath, st.st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+
+def create_scft_calculation(
+    directory: str,
+    *,
+    densities: np.ndarray,
+    b: Sequence[float],
+    block_fractions: Sequence[float],
+    chi_matrix: np.ndarray,
+    grid_shape: Sequence[int],
+    box_lengths: Sequence[float],
+    N: int,
+    ds: float = 0.01,
+    epsilon: float = 1.0e-4,
+    max_itr: int = 4000,
+    max_hist: int = 50,
+    is_flexible: int = 1,
+    group: str = "P_1",
+    overwrite: bool = False,
+) -> str:
+    """Create a self-contained pscf_pc SCFT directory from a density field.
+
+    Writes ``<directory>/{in/c.rf, param, command, run}`` and an empty
+    ``out/``.  Running ``./run`` (with pscf_pc on PATH) seeds SCFT with the
+    supplied density and relaxes it to a nearby self-consistent solution.
+
+    Only diblock (2-monomer) melts are supported for now; anything else raises
+    :class:`NotImplementedError`.
+
+    Parameters
+    ----------
+    directory : str
+        Target directory (created if missing).
+    densities : np.ndarray, shape (2, Nx, Ny, Nz)
+        Monomer volume fractions (phi_A, phi_B), summing to 1 at every point.
+    b, block_fractions, chi_matrix, grid_shape, box_lengths, N
+        Physical system definition.  ``chi_matrix`` holds chi*N and
+        ``box_lengths`` are in the model's absolute units (rescaled here by
+        1/sqrt(N); see the module note).
+    overwrite : bool
+        If False (default) and ``in/c.rf`` already exists, raise; if True,
+        overwrite existing files.
+
+    Returns
+    -------
+    str
+        The calculation directory path.
+    """
+    densities = np.asarray(densities, dtype=np.float64)
+    n_mon = densities.shape[0]
+    if n_mon != 2:
+        raise NotImplementedError(
+            f"Only diblock (2-component) melts are supported; got {n_mon} components."
+        )
+    if tuple(densities.shape[1:]) != tuple(int(m) for m in grid_shape):
+        raise ValueError(
+            f"densities grid {densities.shape[1:]} does not match grid_shape "
+            f"{tuple(grid_shape)}"
+        )
+
+    in_dir = os.path.join(directory, "in")
+    out_dir = os.path.join(directory, "out")
+    c_path = os.path.join(in_dir, "c.rf")
+    if os.path.exists(c_path) and not overwrite:
+        raise FileExistsError(
+            f"{c_path} already exists; pass overwrite=True to replace it."
+        )
+    os.makedirs(in_dir, exist_ok=True)
+    os.makedirs(out_dir, exist_ok=True)
+
+    lattice, cell_params = _cell_from_box_lengths(box_lengths, N)
+
+    write_scft_c_rgrid(c_path, densities, lattice, cell_params, group=group)
+    write_scft_param(
+        os.path.join(directory, "param"),
+        b=b,
+        block_fractions=block_fractions,
+        chi_matrix=chi_matrix,
+        grid_shape=grid_shape,
+        lattice=lattice,
+        cell_params=cell_params,
+        ds=ds,
+        epsilon=epsilon,
+        max_itr=max_itr,
+        max_hist=max_hist,
+        is_flexible=is_flexible,
+        group=group,
+    )
+    write_scft_command(os.path.join(directory, "command"))
+    _write_run_script(os.path.join(directory, "run"))
+    return directory
+
+
+def create_scft_calculation_from_model(
+    directory: str,
+    model: "BlockCopolymerFreeEnergy",
+    *,
+    densities: np.ndarray | None = None,
+    **kwargs,
+) -> str:
+    """Create an SCFT directory from a live BlockCopolymerFreeEnergy model.
+
+    Extracts the physical system definition (Kuhn lengths, block fractions,
+    chi*N matrix, grid, box, N) from ``model`` and its current density field
+    (``model.get_densities()``) unless an explicit ``densities`` array is
+    given.  Extra keyword arguments (ds, epsilon, max_itr, ...) are forwarded
+    to :func:`create_scft_calculation`.
+
+    Only diblock models (2 components) are supported for now.
+    """
+    if model.n_components != 2:
+        raise NotImplementedError(
+            f"Only diblock (2-component) models are supported; got "
+            f"{model.n_components} components."
+        )
+    if densities is None:
+        densities = model.get_densities().detach().cpu().numpy()
+
+    return create_scft_calculation(
+        directory,
+        densities=densities,
+        b=model.b.detach().cpu().numpy().tolist(),
+        block_fractions=model.f_vec.detach().cpu().numpy().tolist(),
+        chi_matrix=model.chi_matrix.detach().cpu().numpy(),
+        grid_shape=model.grid_shape,
+        box_lengths=model.L.detach().cpu().numpy().tolist(),
+        N=model.N,
+        **kwargs,
+    )
